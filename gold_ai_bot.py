@@ -32,6 +32,11 @@ results = []
 # ================= DATA & SIGNALS =================
 def fetch(tf):
     df = yf.download(SYMBOL, period="7d", interval=tf, progress=False)
+
+    # FIX: GC=F MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
     df.dropna(inplace=True)
     df["ema50"] = EMAIndicator(df["Close"],50).ema_indicator()
     df["ema200"] = EMAIndicator(df["Close"],200).ema_indicator()
@@ -40,68 +45,95 @@ def fetch(tf):
 def analyze(df):
     sigs = {}
     last, prev = df.iloc[-1], df.iloc[-2]
+
     sigs["trend"] = "BUY" if last.ema50 > last.ema200 else "SELL"
     sigs["ema"] = "BUY" if last.Close > last.ema50 else "SELL"
-    high, low = df.High[-20:].max(), df.Low[-20:].min()
+
+    high = df["High"].iloc[-20:].max()
+    low  = df["Low"].iloc[-20:].min()
     sigs["sr"] = "BUY" if abs(last.Close - low) < abs(last.Close - high) else "SELL"
+
     sigs["break"] = "BUY" if last.Close > prev.High else "SELL"
+
     hour = last.name.hour
     sigs["session"] = "BUY" if 7 <= hour <= 16 else None
+
     return sigs
 
 def ai_decide(sigs):
     score = {"BUY":0,"SELL":0}
     for k,v in sigs.items():
-        if v: score[v] += weights[k]
+        if v:
+            score[v] += weights[k]
     return max(score, key=score.get) if max(score.values()) >=3 else None
 
 # ================= TELEGRAM =================
-def send_signal(update: Update, choice):
+async def send_signal(update: Update, choice):
     if choice == "MULTI":
-        df_h4, df_h1, df_m30 = fetch(TIMEFRAMES["H4"]), fetch(TIMEFRAMES["H1"]), fetch(TIMEFRAMES["M30"])
-        sig_h4, sig_h1, sig_m30 = analyze(df_h4), analyze(df_h1), analyze(df_m30)
+        df_h4 = fetch(TIMEFRAMES["H4"])
+        df_h1 = fetch(TIMEFRAMES["H1"])
+        df_m30 = fetch(TIMEFRAMES["M30"])
+
+        sig_h4 = analyze(df_h4)
+        sig_h1 = analyze(df_h1)
+        sig_m30 = analyze(df_m30)
+
         if sig_h4["trend"] != sig_h1["trend"]:
-            update.message.reply_text("❌ Timeframes not aligned — NO TRADE")
+            await update.message.reply_text("❌ Timeframes not aligned — NO TRADE")
             return
+
         sigs = sig_m30
         multi_note = f"H4 Trend: {sig_h4['trend']}, H1 Confirm: {sig_h1['trend']}"
     else:
         df = fetch(TIMEFRAMES[choice])
         sigs = analyze(df)
         multi_note = ""
-    
+
     direction = ai_decide(sigs)
     if not direction:
-        update.message.reply_text("❌ No strong confluence — NO TRADE")
+        await update.message.reply_text("❌ No strong confluence — NO TRADE")
         return
 
     last_signals.clear()
     last_signals.extend(sigs.keys())
 
-    update.message.reply_text(
-        f"🟡 GOLD SIGNAL (XAUUSD)\n\n{multi_note}\n\n📍 Direction: {direction}\n🧠 Confidence: {round(sum(weights.values()),2)}\n📊 Signals: {sigs}\n\nReply /win or /loss after trade"
+    await update.message.reply_text(
+        f"🟡 GOLD SIGNAL (XAUUSD)\n\n"
+        f"{multi_note}\n\n"
+        f"📍 Direction: {direction}\n"
+        f"🧠 Confidence: {round(sum(weights.values()),2)}\n"
+        f"📊 Signals: {sigs}\n\n"
+        f"Reply /win or /loss after trade"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
+
     if text == "start":
         kb = [["M30","H1","H4","MULTI"]]
-        await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+        await update.message.reply_text(
+            "Choose timeframe:",
+            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+        )
         return
-    if text.upper() in TIMEFRAMES or text.upper()=="MULTI":
-        send_signal(update, text.upper())
+
+    if text.upper() in TIMEFRAMES or text.upper() == "MULTI":
+        await send_signal(update, text.upper())
         return
+
     await update.message.reply_text("Type 'start' to begin or choose a valid timeframe.")
 
-# ================= WIN/LOSS/RESET/STATS =================
+# ================= WIN / LOSS / STATS =================
 async def win(update: Update, context):
-    for s in last_signals: weights[s]+=0.05
+    for s in last_signals:
+        weights[s] += 0.05
     save_weights(weights)
     results.append(1)
     await update.message.reply_text("✅ Win recorded. AI updated.")
 
 async def loss(update: Update, context):
-    for s in last_signals: weights[s]=max(0.1,weights[s]-0.05)
+    for s in last_signals:
+        weights[s] = max(0.1, weights[s] - 0.05)
     save_weights(weights)
     results.append(0)
     await update.message.reply_text("❌ Loss recorded. AI updated.")
@@ -125,13 +157,15 @@ app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messa
 
 # ================= FAKE WEB SERVER FOR RENDER =================
 flask_app = Flask(__name__)
+
 @flask_app.route("/")
-def home(): return "Bot running"
+def home():
+    return "Bot running"
 
 def run_flask():
-    port = int(os.environ.get("PORT",5000))
+    port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port)
 
 # ================= RUN BOTH =================
-threading.Thread(target=run_flask).start()
+threading.Thread(target=run_flask, daemon=True).start()
 app_bot.run_polling()
