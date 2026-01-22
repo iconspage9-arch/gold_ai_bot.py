@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import json, os
+import json, os, asyncio
 import pytz, datetime as dt
 from ta.trend import EMAIndicator
 from telegram import Update, ReplyKeyboardMarkup
@@ -10,20 +10,20 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
 )
 from flask import Flask
 import threading
 
 # ================= CONFIG =================
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # MUST be set on Render
 SYMBOL = "GC=F"
 WEIGHT_FILE = "ai_weights.json"
 
 TIMEFRAMES = {
     "M30": "30m",
     "H1": "60m",
-    "H4": "4h"
+    "H4": "4h",
 }
 
 DEFAULT_WEIGHTS = {
@@ -31,7 +31,7 @@ DEFAULT_WEIGHTS = {
     "ema": 1.0,
     "sr": 1.0,
     "break": 1.0,
-    "session": 1.0
+    "session": 1.0,
 }
 
 # ================= AI MEMORY =================
@@ -83,38 +83,16 @@ def ai_decide(sigs):
     for k, v in sigs.items():
         if v:
             score[v] += weights[k]
-
     if max(score.values()) >= 3:
         return max(score, key=score.get)
     return None
 
-# ================= TELEGRAM =================
-async def start_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["M30", "H1", "H4", "MULTI"]]
-    await update.message.reply_text(
-        "Choose timeframe:",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
-    )
-
-async def timeframe_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip().upper()
-
-    if choice == "START":
-        await start_text(update, context)
-        return
-
-    if choice not in TIMEFRAMES and choice != "MULTI":
-        await update.message.reply_text("❌ Invalid option. Type start")
-        return
-
-    if not news_safe():
-        await update.message.reply_text("⚠️ High-impact USD news — NO TRADE")
-        return
-
+# ================= SIGNAL SENDER (NON-BLOCKING) =================
+async def send_signal(update, choice):
     if choice == "MULTI":
-        df_h4 = fetch(TIMEFRAMES["H4"])
-        df_h1 = fetch(TIMEFRAMES["H1"])
-        df_m30 = fetch(TIMEFRAMES["M30"])
+        df_h4 = await asyncio.to_thread(fetch, TIMEFRAMES["H4"])
+        df_h1 = await asyncio.to_thread(fetch, TIMEFRAMES["H1"])
+        df_m30 = await asyncio.to_thread(fetch, TIMEFRAMES["M30"])
 
         sig_h4 = analyze(df_h4)
         sig_h1 = analyze(df_h1)
@@ -125,14 +103,13 @@ async def timeframe_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         sigs = sig_m30
-        note = f"H4: {sig_h4['trend']} | H1: {sig_h1['trend']}"
+        multi_note = f"H4: {sig_h4['trend']} | H1: {sig_h1['trend']}"
     else:
-        df = fetch(TIMEFRAMES[choice])
+        df = await asyncio.to_thread(fetch, TIMEFRAMES[choice])
         sigs = analyze(df)
-        note = ""
+        multi_note = ""
 
     direction = ai_decide(sigs)
-
     if not direction:
         await update.message.reply_text("❌ No strong confluence — NO TRADE")
         return
@@ -141,45 +118,66 @@ async def timeframe_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_signals.extend(sigs.keys())
 
     await update.message.reply_text(
-        f"""🟡 GOLD SIGNAL
+        f"""🟡 GOLD SIGNAL (XAUUSD)
 
-{note}
+{multi_note}
 
 📍 Direction: {direction}
+🧠 Confidence: {round(sum(weights.values()), 2)}
 📊 Signals: {sigs}
 
 Reply /win or /loss after trade
 """
     )
 
-# ================= FEEDBACK =================
+# ================= TELEGRAM HANDLER =================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+
+    if text == "start":
+        kb = [["M30", "H1", "H4", "MULTI"]]
+        await update.message.reply_text(
+            "Choose timeframe:",
+            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True),
+        )
+        return
+
+    if text.upper() in TIMEFRAMES or text.upper() == "MULTI":
+        if not news_safe():
+            await update.message.reply_text("⚠️ High-impact USD news — NO TRADE")
+            return
+        await send_signal(update, text.upper())
+        return
+
+    await update.message.reply_text("Type **start** to begin.")
+
+# ================= WIN / LOSS =================
 async def win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in last_signals:
         weights[s] += 0.05
     save_weights(weights)
     results.append(1)
-    await update.message.reply_text("✅ Win recorded.")
+    await update.message.reply_text("✅ Win recorded. AI updated.")
 
 async def loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in last_signals:
         weights[s] = max(0.1, weights[s] - 0.05)
     save_weights(weights)
     results.append(0)
-    await update.message.reply_text("❌ Loss recorded.")
+    await update.message.reply_text("❌ Loss recorded. AI updated.")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    winrate = round(sum(results)/len(results)*100, 2) if results else 0
-    await update.message.reply_text(f"📊 Winrate: {winrate}%\n🧠 {weights}")
+    winrate = round(sum(results) / len(results) * 100, 2) if results else 0
+    await update.message.reply_text(f"📊 Win rate: {winrate}%\n🧠 Weights:\n{weights}")
 
-# ================= BOT =================
-bot = ApplicationBuilder().token(TOKEN).build()
+# ================= TELEGRAM BOT =================
+app_bot = ApplicationBuilder().token(TOKEN).build()
+app_bot.add_handler(CommandHandler("win", win))
+app_bot.add_handler(CommandHandler("loss", loss))
+app_bot.add_handler(CommandHandler("stats", stats))
+app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-bot.add_handler(CommandHandler("win", win))
-bot.add_handler(CommandHandler("loss", loss))
-bot.add_handler(CommandHandler("stats", stats))
-bot.add_handler(MessageHandler(filters.TEXT, timeframe_choice))
-
-# ================= FLASK (RENDER KEEPALIVE) =================
+# ================= FLASK KEEP-ALIVE =================
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -190,6 +188,6 @@ def run_flask():
     port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port)
 
-threading.Thread(target=run_flask).start()
-
-bot.run_polling()
+# ================= RUN BOTH =================
+threading.Thread(target=run_flask, daemon=True).start()
+app_bot.run_polling()
