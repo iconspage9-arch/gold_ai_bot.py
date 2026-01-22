@@ -5,5 +5,5 @@ python-telegram-bot
 ta
 pytz
 python-dotenv
-flask
+Flask
 request
