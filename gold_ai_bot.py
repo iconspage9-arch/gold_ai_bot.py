@@ -10,7 +10,7 @@ from flask import Flask
 import threading
 
 # ================= CONFIG =================
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # must be set in Render environment
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # set this in Render environment
 SYMBOL = "GC=F"
 WEIGHT_FILE = "ai_weights.json"
 
@@ -78,47 +78,7 @@ def ai_decide(sigs):
         return max(score, key=score.get)
     return None
 
-# ================= TELEGRAM =================
-
-# Handle "start" text
-async def start_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower()
-    if text == "start":
-        kb = [["M30", "H1", "H4", "MULTI"]]
-        await update.message.reply_text(
-            "Choose timeframe:",
-            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-        )
-    elif text in ["yes", "no"]:
-        await news_confirmation(update, context)
-    else:
-        await timeframe_choice(update, context)
-
-# Handle timeframe choice
-async def timeframe_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.upper()
-
-    if not news_safe():
-        kb = [["Yes", "No"]]
-        context.user_data["next_choice"] = choice
-        await update.message.reply_text(
-            "⚠️ High-impact USD news window detected. Do you still want to proceed?",
-            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-        )
-        return
-
-    await send_signal(update, context, choice)
-
-# Handle Yes/No confirmation for news
-async def news_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower()
-    if text == "yes" and "next_choice" in context.user_data:
-        choice = context.user_data.pop("next_choice")
-        await send_signal(update, context, choice)
-    elif text == "no":
-        await update.message.reply_text("❌ Trade cancelled due to news.")
-
-# Send signal logic
+# ================= SIGNAL SENDER =================
 async def send_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, choice):
     if choice == "MULTI":
         df_h4 = fetch(TIMEFRAMES["H4"])
@@ -161,6 +121,45 @@ Reply /win or /loss after trade
 """
     )
 
+# ================= TELEGRAM HANDLER =================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+
+    # Typing "start"
+    if text == "start":
+        kb = [["M30", "H1", "H4", "MULTI"]]
+        await update.message.reply_text(
+            "Choose timeframe:",
+            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+        )
+        return
+
+    # Waiting for Yes/No confirmation
+    if text in ["yes", "no"]:
+        if "next_choice" in context.user_data:
+            if text == "yes":
+                choice = context.user_data.pop("next_choice")
+                await send_signal(update, context, choice)
+            else:
+                context.user_data.pop("next_choice")
+                await update.message.reply_text("❌ Trade cancelled due to news.")
+        return
+
+    # Timeframe choice
+    if text.upper() in TIMEFRAMES or text.upper() == "MULTI":
+        if not news_safe():
+            kb = [["Yes", "No"]]
+            context.user_data["next_choice"] = text.upper()
+            await update.message.reply_text(
+                "⚠️ High-impact USD news window detected. Do you still want to proceed?",
+                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+            )
+            return
+        await send_signal(update, context, text.upper())
+        return
+
+    await update.message.reply_text("Type 'start' to begin or choose a valid timeframe.")
+
 # ================= WIN / LOSS =================
 async def win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in last_signals:
@@ -191,7 +190,7 @@ app_bot.add_handler(CommandHandler("win", win))
 app_bot.add_handler(CommandHandler("loss", loss))
 app_bot.add_handler(CommandHandler("stats", stats))
 app_bot.add_handler(CommandHandler("reset_ai", reset_ai))
-app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start_trigger))
+app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 # ================= FAKE WEB SERVER (for free Render) =================
 flask_app = Flask(__name__)
