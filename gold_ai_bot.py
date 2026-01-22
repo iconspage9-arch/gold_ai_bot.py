@@ -8,7 +8,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ================= CONFIG =================
-TOKEN = os.gatenv("TELEGRAM_TOKEN")  # replace safely
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # replace safely
 SYMBOL = "GC=F"  # Gold futures proxy
 WEIGHT_FILE = "ai_weights.json"
 
