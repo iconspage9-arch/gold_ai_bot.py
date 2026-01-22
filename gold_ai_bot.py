@@ -6,9 +6,10 @@ import pytz, datetime as dt
 from ta.trend import EMAIndicator
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from flask import Flask
 
 # ================= CONFIG =================
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # replace safely
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # must be set in Render environment
 SYMBOL = "GC=F"  # Gold futures proxy
 WEIGHT_FILE = "ai_weights.json"
 
@@ -43,9 +44,9 @@ results = []
 HIGH_IMPACT = ["CPI", "NFP", "FOMC", "FED", "INFLATION", "RATE"]
 
 def news_safe():
-    # simplified safety (can be expanded with real API)
+    # simplified USD news filter (can expand with API)
     hour = dt.datetime.now(pytz.UTC).hour
-    return not (12 <= hour <= 14)  # typical USD news window
+    return not (12 <= hour <= 14)
 
 # ================= DATA =================
 def fetch(tf):
@@ -176,12 +177,31 @@ async def reset_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_weights(weights)
     await update.message.reply_text("♻️ AI reset to default.")
 
-# ================= RUN =================
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("win", win))
-app.add_handler(CommandHandler("loss", loss))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("reset_ai", reset_ai))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, timeframe_choice))
-app.run_polling()
+# ================= RUN TELEGRAM BOT =================
+app_bot = ApplicationBuilder().token(TOKEN).build()
+app_bot.add_handler(CommandHandler("start", start))
+app_bot.add_handler(CommandHandler("win", win))
+app_bot.add_handler(CommandHandler("loss", loss))
+app_bot.add_handler(CommandHandler("stats", stats))
+app_bot.add_handler(CommandHandler("reset_ai", reset_ai))
+app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, timeframe_choice))
+
+# ================= FAKE WEB SERVER (for free Render) =================
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def home():
+    return "Bot running"
+
+# ================= RUN BOTH =================
+import threading
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port)
+
+# Start Flask in a thread
+threading.Thread(target=run_flask).start()
+
+# Start Telegram bot (blocking)
+app_bot.run_polling()
