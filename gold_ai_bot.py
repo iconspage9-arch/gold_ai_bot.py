@@ -5,34 +5,41 @@ import json, os
 import pytz, datetime as dt
 from ta.trend import EMAIndicator
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from flask import Flask
 import threading
 
 # ================= CONFIG =================
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-SYMBOL = "GC=F"
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # set in Render environment
+SYMBOL = "GC=F"  # Gold futures
 WEIGHT_FILE = "ai_weights.json"
 
-TIMEFRAMES = {"M30": "30m", "H1": "60m", "H4": "4h"}
-DEFAULT_WEIGHTS = {"trend": 1.0, "ema": 1.0, "sr": 1.0, "break": 1.0, "session": 1.0}
+TIMEFRAMES = {
+    "M30": "30m",
+    "H1": "60m",
+    "H4": "4h"
+}
 
-weights = {}
-last_signals = []
-results = []
+DEFAULT_WEIGHTS = {
+    "trend": 1.0,
+    "ema": 1.0,
+    "sr": 1.0,
+    "break": 1.0,
+    "session": 1.0
+}
 
+# ================= AI MEMORY =================
 def load_weights():
-    global weights
     if os.path.exists(WEIGHT_FILE):
-        weights = json.load(open(WEIGHT_FILE))
-    else:
-        weights = DEFAULT_WEIGHTS.copy()
-    return weights
+        return json.load(open(WEIGHT_FILE))
+    return DEFAULT_WEIGHTS.copy()
 
 def save_weights(w):
     json.dump(w, open(WEIGHT_FILE, "w"), indent=2)
 
-load_weights()
+weights = load_weights()
+last_signals = []
+results = []
 
 # ================= DATA =================
 def fetch(tf):
@@ -42,6 +49,7 @@ def fetch(tf):
     df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
     return df
 
+# ================= SIGNAL ENGINE =================
 def analyze(df):
     sigs = {}
     last, prev = df.iloc[-1], df.iloc[-2]
@@ -59,7 +67,35 @@ def ai_decide(sigs):
     for k, v in sigs.items():
         if v:
             score[v] += weights[k]
-    return max(score, key=score.get) if max(score.values()) >= 3 else None
+    if max(score.values()) >= 3:
+        return max(score, key=score.get)
+    return None
+
+# ================= SIGNAL SENDER =================
+async def send_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, choice):
+    # Fetch data in a thread to avoid blocking async
+    loop = context.application.loop
+    df = await loop.run_in_executor(None, fetch, TIMEFRAMES[choice])
+    sigs = await loop.run_in_executor(None, analyze, df)
+    direction = ai_decide(sigs)
+    
+    if not direction:
+        await update.message.reply_text("❌ No strong confluence — NO TRADE")
+        return
+
+    last_signals.clear()
+    last_signals.extend(sigs.keys())
+
+    await update.message.reply_text(
+        f"""🟡 GOLD SIGNAL (XAUUSD)
+
+📍 Direction: {direction}
+🧠 Confidence: {round(sum(weights.values()),2)}
+📊 Signals: {sigs}
+
+Reply /win or /loss after trade
+"""
+    )
 
 # ================= TELEGRAM HANDLER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,84 +110,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Waiting for Yes/No confirmation
-    if text in ["yes", "no"]:
-        if "next_choice" in context.user_data:
-            choice = context.user_data.pop("next_choice")
-            if text == "yes":
-                await send_signal(update, context, choice)
-            else:
-                await update.message.reply_text("❌ Trade cancelled due to news.")
-        return
-
     # Timeframe choice
-    if text.upper() in TIMEFRAMES or text.upper() == "MULTI":
-        if not news_safe():
-            kb = [["Yes", "No"]]
-            context.user_data["next_choice"] = text.upper()
-            await update.message.reply_text(
-                "⚠️ High-impact USD news detected. Proceed?",
-                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-            )
-            return
+    if text.upper() in TIMEFRAMES:
         await send_signal(update, context, text.upper())
         return
 
-    await update.message.reply_text("Type 'start' to begin or choose a valid timeframe.")
+    await update.message.reply_text("Type 'start' to begin or choose a valid timeframe (M30, H1, H4).")
 
-# ================= SIGNAL SENDER =================
-def news_safe():
-    hour = dt.datetime.now(pytz.UTC).hour
-    return not (12 <= hour <= 14)
-
-async def send_signal(update, context, choice):
-    if choice == "MULTI":
-        df_h4, df_h1, df_m30 = fetch(TIMEFRAMES["H4"]), fetch(TIMEFRAMES["H1"]), fetch(TIMEFRAMES["M30"])
-        sig_h4, sig_h1, sig_m30 = analyze(df_h4), analyze(df_h1), analyze(df_m30)
-        if sig_h4["trend"] != sig_h1["trend"]:
-            await update.message.reply_text("❌ Timeframes not aligned — NO TRADE")
-            return
-        sigs = sig_m30
-        multi_note = f"H4 Trend: {sig_h4['trend']}, H1 Confirm: {sig_h1['trend']}"
-    else:
-        df = fetch(TIMEFRAMES[choice])
-        sigs = analyze(df)
-        multi_note = ""
-    direction = ai_decide(sigs)
-    if not direction:
-        await update.message.reply_text("❌ No strong confluence — NO TRADE")
-        return
-    last_signals.clear()
-    last_signals.extend(sigs.keys())
-    await update.message.reply_text(
-        f"🟡 GOLD SIGNAL (XAUUSD)\n\n{multi_note}\n\n📍 Direction: {direction}\n🧠 Confidence: {round(sum(weights.values()),2)}\n📊 Signals: {sigs}\n\nReply /win or /loss after trade"
-    )
-
-# ================= WIN/LOSS =================
-async def win(update, context):
+# ================= WIN / LOSS =================
+async def win(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in last_signals:
         weights[s] += 0.05
     save_weights(weights)
     results.append(1)
     await update.message.reply_text("✅ Win recorded. AI updated.")
 
-async def loss(update, context):
+async def loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in last_signals:
         weights[s] = max(0.1, weights[s] - 0.05)
     save_weights(weights)
     results.append(0)
     await update.message.reply_text("❌ Loss recorded. AI updated.")
 
-async def stats(update, context):
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     winrate = round(sum(results)/len(results)*100, 2) if results else 0
     await update.message.reply_text(f"📊 Win rate: {winrate}%\n🧠 Weights:\n{weights}")
 
-async def reset_ai(update, context):
+async def reset_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     weights.update(DEFAULT_WEIGHTS)
     save_weights(weights)
     await update.message.reply_text("♻️ AI reset to default.")
 
-# ================= FLASK =================
+# ================= RUN TELEGRAM BOT =================
+app_bot = ApplicationBuilder().token(TOKEN).build()
+app_bot.add_handler(CommandHandler("win", win))
+app_bot.add_handler(CommandHandler("loss", loss))
+app_bot.add_handler(CommandHandler("stats", stats))
+app_bot.add_handler(CommandHandler("reset_ai", reset_ai))
+app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# ================= FAKE WEB SERVER (for free Render) =================
 flask_app = Flask(__name__)
 @flask_app.route("/")
 def home():
@@ -161,13 +159,6 @@ def run_flask():
     port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port)
 
-# ================= RUN =================
-app_bot = ApplicationBuilder().token(TOKEN).build()
-app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-app_bot.add_handler(MessageHandler(filters.TEXT & filters.Regex("^/win$"), win))
-app_bot.add_handler(MessageHandler(filters.TEXT & filters.Regex("^/loss$"), loss))
-app_bot.add_handler(MessageHandler(filters.TEXT & filters.Regex("^/stats$"), stats))
-app_bot.add_handler(MessageHandler(filters.TEXT & filters.Regex("^/reset_ai$"), reset_ai))
-
-threading.Thread(target=run_flask, daemon=True).start()
-app_bot.run_polling(stop_signals=None)
+# ================= RUN BOTH =================
+threading.Thread(target=run_flask).start()
+app_bot.run_polling()
