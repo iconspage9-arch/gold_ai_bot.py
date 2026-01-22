@@ -5,7 +5,9 @@ import json, os
 import threading
 import time
 import requests
-from ta.trend import EMAIndicator
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 from flask import Flask
@@ -21,22 +23,68 @@ def fetch(tf):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.dropna(inplace=True)
-    df["ema50"] = EMAIndicator(df["Close"],50).ema_indicator()
-    df["ema200"] = EMAIndicator(df["Close"],200).ema_indicator()
+    
+    # Calculate indicators
+    df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
+    df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+    df["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
+    
+    macd = MACD(df["Close"], window_fast=12, window_slow=26, window_sign=9)
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    
+    df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+    
     return df
 
 def analyze(df):
-    sigs = {}
-    last, prev = df.iloc[-1], df.iloc[-2]
-    sigs["Trend"] = "BUY" if last.ema50 > last.ema200 else "SELL"
-    sigs["EMA"] = "BUY" if last.Close > last.ema50 else "SELL"
-    high = df["High"].iloc[-20:].max()
-    low  = df["Low"].iloc[-20:].min()
-    sigs["Support/Resistance"] = "BUY" if abs(last.Close - low) < abs(last.Close - high) else "SELL"
-    sigs["Breakout"] = "BUY" if last.Close > prev.High else "SELL"
-    hour = last.name.hour
-    sigs["Session"] = "BUY" if 7 <= hour <= 16 else "OFF"
-    return sigs
+    last = df.iloc[-1]
+    signals = []
+    
+    # Signal 1: EMA Trend (50/200 crossover)
+    ema_signal = "BUY" if last.ema50 > last.ema200 else "SELL"
+    signals.append(ema_signal)
+    
+    # Signal 2: RSI (oversold/overbought)
+    rsi_signal = "BUY" if last.rsi < 30 else ("SELL" if last.rsi > 70 else "NEUTRAL")
+    if rsi_signal != "NEUTRAL":
+        signals.append(rsi_signal)
+    
+    # Signal 3: MACD Momentum
+    macd_signal = "BUY" if last.macd > last.macd_signal else "SELL"
+    signals.append(macd_signal)
+    
+    # Count agreement
+    buy_count = signals.count("BUY")
+    sell_count = signals.count("SELL")
+    total = len(signals)
+    
+    # Determine final signal
+    if buy_count > sell_count:
+        final_signal = "BUY"
+        agreement = (buy_count / total) * 100 if total > 0 else 0
+    else:
+        final_signal = "SELL"
+        agreement = (sell_count / total) * 100 if total > 0 else 0
+    
+    # Calculate TP and SL based on ATR
+    atr = last.atr if pd.notna(last.atr) else 0
+    if final_signal == "BUY":
+        tp = last.Close + (atr * 2)  # TP = 2 ATR above entry
+        sl = last.Close - atr  # SL = 1 ATR below entry
+    else:
+        tp = last.Close - (atr * 2)  # TP = 2 ATR below entry
+        sl = last.Close + atr  # SL = 1 ATR above entry
+    
+    return {
+        "signal": final_signal,
+        "agreement": agreement,
+        "ema": ema_signal,
+        "rsi": round(last.rsi, 2),
+        "macd": "UP" if last.macd > last.macd_signal else "DOWN",
+        "tp": round(tp, 2),
+        "sl": round(sl, 2)
+    }
 
 # ================= TELEGRAM =================
 async def send_signal(update: Update, choice):
@@ -47,21 +95,29 @@ async def send_signal(update: Update, choice):
         sig_h4 = analyze(df_h4)
         sig_h1 = analyze(df_h1)
         sig_m30 = analyze(df_m30)
-        note = f"H4 Trend: {sig_h4['Trend']} | H1 Trend: {sig_h1['Trend']}"
+        note = f"H4: {sig_h4['signal']} ({sig_h4['agreement']:.0f}%) | H1: {sig_h1['signal']} ({sig_h1['agreement']:.0f}%)"
         sigs = sig_m30
+        df = df_m30
     else:
         df = fetch(TIMEFRAMES[choice])
         sigs = analyze(df)
         note = ""
 
-    emoji = {"BUY":"🟢 BUY", "SELL":"🔴 SELL", "OFF":"⚪ OFF"}
-    signal_text = "\n".join([f"{k}: {emoji[v]}" for k,v in sigs.items()])
+    emoji = {"BUY":"🟢 BUY", "SELL":"🔴 SELL"}
+    signal = sigs["signal"]
 
     await update.message.reply_text(
-        f"🟡 GOLD SIGNAL BREAKDOWN (XAUUSD)\n\n"
-        f"{note}\n\n"
-        f"{signal_text}\n\n"
-        f"🧠 Each line shows what that signal suggests"
+        f"🟡 GOLD SIGNAL (XAUUSD)\n\n"
+        f"{emoji[signal]} {signal} - {sigs['agreement']:.0f}% Agreement\n\n"
+        f"📊 INDICATORS:\n"
+        f"EMA (50/200): {sigs['ema']}\n"
+        f"RSI (14): {sigs['rsi']}\n"
+        f"MACD: {sigs['macd']}\n\n"
+        f"🎯 TARGETS:\n"
+        f"Entry: ${df.iloc[-1]['Close']:.2f}\n"
+        f"Take Profit: ${sigs['tp']:.2f}\n"
+        f"Stop Loss: ${sigs['sl']:.2f}\n\n"
+        f"{note}"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
