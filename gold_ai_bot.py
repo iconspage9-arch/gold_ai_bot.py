@@ -257,7 +257,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             symbol = build_forex_symbol(user_data["base"], user_data["quote"])
             user_data["pair"] = symbol
             user_data["pair_name"] = f"{user_data['base']}{user_data['quote']}"
-            ask_for_timeframe(update)
+            await ask_for_timeframe(update)
             return
     
     # Step 3 (non-Forex): Pair selected directly
@@ -266,7 +266,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.upper() in PAIRS_BY_TYPE[pair_type]:
             user_data["pair_name"] = text.upper()
             user_data["pair"] = PAIRS_BY_TYPE[pair_type][text.upper()]
-            ask_for_timeframe(update)
+            await ask_for_timeframe(update)
             return
     
     # Step 5: Timeframe selected - analyze and send signal
