@@ -72,19 +72,19 @@ def analyze(df):
 
     entry = last.Close
 
-    # Look back windows for support/resistance (shorter for tighter targets)
-    lookback = min(len(df) - 1, 30)
+    # Look back windows for support/resistance
+    lookback = min(len(df) - 1, 40)
     prev_highs = df['High'].iloc[-(lookback+1):-1] if lookback > 0 else pd.Series(dtype=float)
     prev_lows = df['Low'].iloc[-(lookback+1):-1] if lookback > 0 else pd.Series(dtype=float)
 
-    # Recent ranges for consolidation detection (narrower window)
-    range_window = min(len(df), 10)
+    # Recent ranges for consolidation detection
+    range_window = min(len(df), 15)
     recent_high = df['High'].iloc[-range_window:].max()
     recent_low = df['Low'].iloc[-range_window:].min()
 
     # If market is consolidating (tight range relative to ATR), prefer highs/lows as TP/SL
     consolidation = False
-    if atr > 0 and (recent_high - recent_low) < (atr * 1.2):
+    if atr > 0 and (recent_high - recent_low) < (atr * 1.4):
         consolidation = True
 
     if final_signal == "BUY":
@@ -95,14 +95,14 @@ def analyze(df):
         elif not candidates_tp.empty:
             tp = candidates_tp.min()
         else:
-            tp = entry + max(atr * 1.0, (recent_high - entry))
+            tp = entry + max(atr * 1.3, (recent_high - entry))
 
         # SL: nearest previous low below entry (support)
         candidates_sl = prev_lows[prev_lows < entry]
         if not candidates_sl.empty:
             sl = candidates_sl.max()
         else:
-            sl = entry - max(atr * 0.4, (entry - recent_low))
+            sl = entry - max(atr * 0.6, (entry - recent_low))
     else:
         # SELL
         candidates_tp = prev_lows[prev_lows < entry]
@@ -111,13 +111,13 @@ def analyze(df):
         elif not candidates_tp.empty:
             tp = candidates_tp.max()
         else:
-            tp = entry - max(atr * 1.0, (entry - recent_low))
+            tp = entry - max(atr * 1.3, (entry - recent_low))
 
         candidates_sl = prev_highs[prev_highs > entry]
         if not candidates_sl.empty:
             sl = candidates_sl.min()
         else:
-            sl = entry + max(atr * 0.4, (recent_high - entry))
+            sl = entry + max(atr * 0.6, (recent_high - entry))
     
     return {
         "signal": final_signal,
