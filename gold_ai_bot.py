@@ -14,12 +14,60 @@ from flask import Flask
 
 # ================= CONFIG =================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-SYMBOL = "GC=F"
 TIMEFRAMES = {"M30": "30m", "H1": "60m", "H4": "4h"}
 
+# Available trading pairs
+PAIRS = {
+    # Commodities
+    "GOLD": "GC=F",
+    "SILVER": "SI=F",
+    "OIL": "CL=F",
+    "COPPER": "HG=F",
+    "NATGAS": "NG=F",
+    
+    # Forex
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "AUDUSD": "AUDUSD=X",
+    "NZDUSD": "NZDUSD=X",
+    "USDCAD": "USDCAD=X",
+    "USDCHF": "USDCHF=X",
+    "EURGBP": "EURGBP=X",
+    "EURGBP": "EURGBP=X",
+    "EURCHF": "EURCHF=X",
+    "GBPJPY": "GBPJPY=X",
+    "AUDJPY": "AUDJPY=X",
+    
+    # Crypto
+    "BTCUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+    "LTCUSD": "LTC-USD",
+    "XRPUSD": "XRP-USD",
+    "ADAUSD": "ADA-USD",
+    "DOGEUSD": "DOGE-USD",
+    "BNBUSD": "BNB-USD",
+    "SOLUSD": "SOL-USD",
+    "POLKAUSD": "DOT-USD",
+    "LINKUSD": "LINK-USD",
+    
+    # Indices
+    "SP500": "^GSPC",
+    "DOWJONES": "^DJI",
+    "NASDAQ": "^IXIC",
+    "DAX": "^GDAXI",
+    "FTSE": "^FTSE",
+    "NIKKEI": "^N225",
+    "HSI": "^HSI",
+    
+    # Forex Cross Rates
+    "EUJPY": "EURJPY=X",
+    "CADCHF": "CADCHF=X",
+}
+
 # ================= DATA FUNCTIONS =================
-def fetch(tf):
-    df = yf.download(SYMBOL, period="7d", interval=tf, progress=False)
+def fetch(tf, symbol="GC=F"):
+    df = yf.download(symbol, period="7d", interval=tf, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.dropna(inplace=True)
@@ -120,11 +168,13 @@ def analyze(df):
     }
 
 # ================= TELEGRAM =================
-async def send_signal(update: Update, choice):
+async def send_signal(update: Update, choice, symbol="GC=F"):
+    pair_name = [k for k, v in PAIRS.items() if v == symbol][0] if symbol in PAIRS.values() else symbol
+    
     if choice == "MULTI":
-        df_h4 = fetch(TIMEFRAMES["H4"])
-        df_h1 = fetch(TIMEFRAMES["H1"])
-        df_m30 = fetch(TIMEFRAMES["M30"])
+        df_h4 = fetch(TIMEFRAMES["H4"], symbol)
+        df_h1 = fetch(TIMEFRAMES["H1"], symbol)
+        df_m30 = fetch(TIMEFRAMES["M30"], symbol)
         sig_h4 = analyze(df_h4)
         sig_h1 = analyze(df_h1)
         sig_m30 = analyze(df_m30)
@@ -132,7 +182,7 @@ async def send_signal(update: Update, choice):
         sigs = sig_m30
         df = df_m30
     else:
-        df = fetch(TIMEFRAMES[choice])
+        df = fetch(TIMEFRAMES[choice], symbol)
         sigs = analyze(df)
         note = ""
 
@@ -140,7 +190,7 @@ async def send_signal(update: Update, choice):
     signal = sigs["signal"]
 
     await update.message.reply_text(
-        f"🟡 GOLD SIGNAL (XAUUSD)\n\n"
+        f"🟡 {pair_name} SIGNAL\n\n"
         f"{emoji[signal]} {signal} - {sigs['agreement']:.0f}% Agreement\n\n"
         f"📊 INDICATORS:\n"
         f"EMA (50/200): {sigs['ema']}\n"
@@ -158,14 +208,23 @@ async def send_signal(update: Update, choice):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
     if text == "start":
+        kb = [list(PAIRS.keys())]
+        await update.message.reply_text(
+            "Choose a pair:",
+            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+        )
+        return
+    if text.upper() in PAIRS:
+        context.user_data["selected_pair"] = PAIRS[text.upper()]
         kb = [["M30","H1","H4","MULTI"]]
         await update.message.reply_text(
-            "Choose timeframe:",
+            f"Pair: {text.upper()} - Choose timeframe:",
             reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
         )
         return
     if text.upper() in TIMEFRAMES or text.upper() == "MULTI":
-        await send_signal(update, text.upper())
+        symbol = context.user_data.get("selected_pair", "GC=F")
+        await send_signal(update, text.upper(), symbol)
         return
     await update.message.reply_text("Type *start* to begin.", parse_mode="Markdown")
 
