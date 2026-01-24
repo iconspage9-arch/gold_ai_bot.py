@@ -5,9 +5,7 @@ import json, os
 import threading
 import time
 import requests
-from ta.trend import EMAIndicator, MACD
-from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
+from ta.trend import EMAIndicator
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 from flask import Flask
@@ -23,111 +21,47 @@ def fetch(tf):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.dropna(inplace=True)
-    
-    # Calculate indicators
-    df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-    df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
-    df["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
-    
-    macd = MACD(df["Close"], window_fast=12, window_slow=26, window_sign=9)
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    
-    df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
-    
+    df["ema50"] = EMAIndicator(df["Close"],50).ema_indicator()
+    df["ema200"] = EMAIndicator(df["Close"],200).ema_indicator()
     return df
 
 def analyze(df):
-    last = df.iloc[-1]
-    signals = []
-    
-    # Signal 1: EMA Trend (50/200 crossover)
-    ema_signal = "BUY" if last.ema50 > last.ema200 else "SELL"
-    signals.append(ema_signal)
-    
-    # Signal 2: RSI (oversold/overbought)
-    rsi_signal = "BUY" if last.rsi < 30 else ("SELL" if last.rsi > 70 else "NEUTRAL")
-    if rsi_signal != "NEUTRAL":
-        signals.append(rsi_signal)
-    
-    # Signal 3: MACD Momentum
-    macd_signal = "BUY" if last.macd > last.macd_signal else "SELL"
-    signals.append(macd_signal)
-    
-    # Count agreement
-    buy_count = signals.count("BUY")
-    sell_count = signals.count("SELL")
-    total = len(signals)
-    
-    # Determine final signal
-    if buy_count > sell_count:
-        final_signal = "BUY"
-        agreement = (buy_count / total) * 100 if total > 0 else 0
+    sigs = {}
+    last, prev = df.iloc[-1], df.iloc[-2]
+    sigs["Trend"] = "BUY" if last.ema50 > last.ema200 else "SELL"
+    sigs["EMA"] = "BUY" if last.Close > last.ema50 else "SELL"
+    high = df["High"].iloc[-20:].max()
+    low  = df["Low"].iloc[-20:].min()
+    sigs["Support/Resistance"] = "BUY" if abs(last.Close - low) < abs(last.Close - high) else "SELL"
+    sigs["Breakout"] = "BUY" if last.Close > prev.High else "SELL"
+    hour = last.name.hour
+    sigs["Session"] = "BUY" if 7 <= hour <= 16 else "OFF"
+    return sigs, last.Close, high, low
+
+# ================= TRADE CALCULATION =================
+def determine_direction(sigs):
+    counts = {"BUY":0, "SELL":0}
+    for v in sigs.values():
+        if v in counts:
+            counts[v] +=1
+    if counts["BUY"] > counts["SELL"]:
+        return "BUY"
+    elif counts["SELL"] > counts["BUY"]:
+        return "SELL"
     else:
-        final_signal = "SELL"
-        agreement = (sell_count / total) * 100 if total > 0 else 0
-    
-    # Calculate TP and SL using recent highs/lows or consolidation zones
-    atr = last.atr if pd.notna(last.atr) else 0
+        return None
 
-    entry = last.Close
-
-    # Look back windows for support/resistance
-    lookback = min(len(df) - 1, 40)
-    prev_highs = df['High'].iloc[-(lookback+1):-1] if lookback > 0 else pd.Series(dtype=float)
-    prev_lows = df['Low'].iloc[-(lookback+1):-1] if lookback > 0 else pd.Series(dtype=float)
-
-    # Recent ranges for consolidation detection
-    range_window = min(len(df), 15)
-    recent_high = df['High'].iloc[-range_window:].max()
-    recent_low = df['Low'].iloc[-range_window:].min()
-
-    # If market is consolidating (tight range relative to ATR), prefer highs/lows as TP/SL
-    consolidation = False
-    if atr > 0 and (recent_high - recent_low) < (atr * 1.4):
-        consolidation = True
-
-    if final_signal == "BUY":
-        # TP: nearest previous high above entry (closest resistance)
-        candidates_tp = prev_highs[prev_highs > entry]
-        if consolidation:
-            tp = recent_high
-        elif not candidates_tp.empty:
-            tp = candidates_tp.min()
-        else:
-            tp = entry + max(atr * 1.3, (recent_high - entry))
-
-        # SL: nearest previous low below entry (support)
-        candidates_sl = prev_lows[prev_lows < entry]
-        if not candidates_sl.empty:
-            sl = candidates_sl.max()
-        else:
-            sl = entry - max(atr * 0.6, (entry - recent_low))
+def calculate_trade_levels(direction, entry, high, low):
+    buffer = 0.5  # small buffer for SL
+    if direction == "BUY":
+        sl = low - buffer
+        tp = entry + (entry - sl)*2  # RR=1:2
+    elif direction == "SELL":
+        sl = high + buffer
+        tp = entry - (sl - entry)*2
     else:
-        # SELL
-        candidates_tp = prev_lows[prev_lows < entry]
-        if consolidation:
-            tp = recent_low
-        elif not candidates_tp.empty:
-            tp = candidates_tp.max()
-        else:
-            tp = entry - max(atr * 1.3, (entry - recent_low))
-
-        candidates_sl = prev_highs[prev_highs > entry]
-        if not candidates_sl.empty:
-            sl = candidates_sl.min()
-        else:
-            sl = entry + max(atr * 0.6, (recent_high - entry))
-    
-    return {
-        "signal": final_signal,
-        "agreement": agreement,
-        "ema": ema_signal,
-        "rsi": round(last.rsi, 2),
-        "macd": "UP" if last.macd > last.macd_signal else "DOWN",
-        "tp": round(tp, 2),
-        "sl": round(sl, 2)
-    }
+        sl, tp = None, None
+    return sl, tp
 
 # ================= TELEGRAM =================
 async def send_signal(update: Update, choice):
@@ -135,32 +69,29 @@ async def send_signal(update: Update, choice):
         df_h4 = fetch(TIMEFRAMES["H4"])
         df_h1 = fetch(TIMEFRAMES["H1"])
         df_m30 = fetch(TIMEFRAMES["M30"])
-        sig_h4 = analyze(df_h4)
-        sig_h1 = analyze(df_h1)
-        sig_m30 = analyze(df_m30)
-        note = f"H4: {sig_h4['signal']} ({sig_h4['agreement']:.0f}%) | H1: {sig_h1['signal']} ({sig_h1['agreement']:.0f}%)"
-        sigs = sig_m30
-        df = df_m30
+        sig_h4, _, _, _ = analyze(df_h4)
+        sig_h1, _, _, _ = analyze(df_h1)
+        sigs, entry, high, low = analyze(df_m30)
+        note = f"H4 Trend: {sig_h4['Trend']} | H1 Trend: {sig_h1['Trend']}"
     else:
         df = fetch(TIMEFRAMES[choice])
-        sigs = analyze(df)
+        sigs, entry, high, low = analyze(df)
         note = ""
 
-    emoji = {"BUY":"🟢 BUY", "SELL":"🔴 SELL"}
-    signal = sigs["signal"]
+    direction = determine_direction(sigs)
+    sl, tp = calculate_trade_levels(direction, entry, high, low)
+
+    emoji = {"BUY":"🟢 BUY", "SELL":"🔴 SELL", "OFF":"⚪ OFF"}
+    signal_text = "\n".join([f"{k}: {emoji[v]}" for k,v in sigs.items()])
+
+    trade_text = f"Direction: {direction}\nEntry: {entry:.2f}\nStop-Loss: {sl:.2f}\nTake-Profit: {tp:.2f}" if direction else "No clear direction"
 
     await update.message.reply_text(
-        f"🟡 GOLD SIGNAL (XAUUSD)\n\n"
-        f"{emoji[signal]} {signal} - {sigs['agreement']:.0f}% Agreement\n\n"
-        f"📊 INDICATORS:\n"
-        f"EMA (50/200): {sigs['ema']}\n"
-        f"RSI (14): {sigs['rsi']}\n"
-        f"MACD: {sigs['macd']}\n\n"
-        f"🎯 TARGETS:\n"
-        f"Entry: ${df.iloc[-1]['Close']:.2f}\n"
-        f"Take Profit: ${sigs['tp']:.2f}\n"
-        f"Stop Loss: ${sigs['sl']:.2f}\n\n"
-        f"{note}"
+        f"🟡 GOLD SIGNAL BREAKDOWN (XAUUSD)\n\n"
+        f"{note}\n\n"
+        f"{signal_text}\n\n"
+        f"💰 Trade Suggestion:\n{trade_text}\n\n"
+        f"🧠 Signals only — use discretion"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,7 +132,7 @@ def keep_alive():
             requests.get(url)
         except:
             pass
-        time.sleep(300)  # Ping every 5 minutes
+        time.sleep(300)  # ping every 5 minutes
 
 # ================= RUN BOTH =================
 threading.Thread(target=run_flask, daemon=True).start()
