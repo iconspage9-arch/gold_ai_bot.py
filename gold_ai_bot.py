@@ -6,8 +6,8 @@ import threading
 import time
 import requests
 from ta.trend import EMAIndicator, MACD
-from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.volatility import AverageTrueRange, BollingerBands
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 from flask import Flask
@@ -35,6 +35,17 @@ def fetch(tf):
     
     df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
     
+    # Bollinger Bands
+    bb = BollingerBands(df["Close"], window=20, window_dev=2)
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_lower"] = bb.bollinger_lband()
+    df["bb_mid"] = bb.bollinger_mavg()
+    
+    # Stochastic
+    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"], window=14, smooth_k=3, smooth_d=3)
+    df["stoch_k"] = stoch.stoch()
+    df["stoch_d"] = stoch.stoch_signal()
+    
     return df
 
 def analyze(df):
@@ -53,6 +64,26 @@ def analyze(df):
     # Signal 3: MACD Momentum
     macd_signal = "BUY" if last.macd > last.macd_signal else "SELL"
     signals.append(macd_signal)
+    
+    # Signal 4: Bollinger Bands
+    bb_signal = "NEUTRAL"
+    if pd.notna(last.bb_lower) and pd.notna(last.bb_upper):
+        if last.Close <= last.bb_lower:
+            bb_signal = "BUY"  # Price at/below lower band = oversold
+        elif last.Close >= last.bb_upper:
+            bb_signal = "SELL"  # Price at/above upper band = overbought
+    if bb_signal != "NEUTRAL":
+        signals.append(bb_signal)
+    
+    # Signal 5: Stochastic
+    stoch_signal = "NEUTRAL"
+    if pd.notna(last.stoch_k):
+        if last.stoch_k < 20:
+            stoch_signal = "BUY"  # Oversold
+        elif last.stoch_k > 80:
+            stoch_signal = "SELL"  # Overbought
+    if stoch_signal != "NEUTRAL":
+        signals.append(stoch_signal)
     
     # Count agreement
     buy_count = signals.count("BUY")
@@ -82,6 +113,8 @@ def analyze(df):
         "ema": ema_signal,
         "rsi": round(last.rsi, 2),
         "macd": "UP" if last.macd > last.macd_signal else "DOWN",
+        "bb": bb_signal,
+        "stoch": round(last.stoch_k, 2) if pd.notna(last.stoch_k) else 0,
         "tp": round(tp, 2),
         "sl": round(sl, 2)
     }
@@ -112,7 +145,9 @@ async def send_signal(update: Update, choice):
         f"📊 INDICATORS:\n"
         f"EMA (50/200): {sigs['ema']}\n"
         f"RSI (14): {sigs['rsi']}\n"
-        f"MACD: {sigs['macd']}\n\n"
+        f"MACD: {sigs['macd']}\n"
+        f"Bollinger Bands: {sigs['bb']}\n"
+        f"Stochastic: {sigs['stoch']}\n\n"
         f"🎯 TARGETS:\n"
         f"Entry: ${df.iloc[-1]['Close']:.2f}\n"
         f"Take Profit: ${sigs['tp']:.2f}\n"
