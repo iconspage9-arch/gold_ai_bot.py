@@ -42,7 +42,7 @@ def fetch(tf):
     df["bb_mid"] = bb.bollinger_mavg()
     
     # Stochastic
-    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"], window=14, smooth_k=3, smooth_d=3)
+    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"], window=14)
     df["stoch_k"] = stoch.stoch()
     df["stoch_d"] = stoch.stoch_signal()
     
