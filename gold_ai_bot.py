@@ -65,7 +65,7 @@ def build_forex_symbol(base, quote):
 
 # ================= DATA FUNCTIONS =================
 def fetch(tf, symbol="GC=F"):
-    df = yf.download(symbol, period="7d", interval=tf, progress=False)
+    df = yf.download(symbol, period="30d", interval=tf, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.dropna(inplace=True)
@@ -176,8 +176,10 @@ def analyze(df, symbol=None):
             candidates_sl = prev_lows[prev_lows < entry]
             if not candidates_sl.empty:
                 sl = candidates_sl.max()
+                # Cap SL: never more than 2*ATR away
+                sl = max(sl, entry - (atr * 2))
             else:
-                sl = entry - atr
+                sl = entry - (atr * 1.5)
         else:
             candidates_tp = prev_lows[prev_lows < entry]
             if consolidation:
@@ -190,8 +192,10 @@ def analyze(df, symbol=None):
             candidates_sl = prev_highs[prev_highs > entry]
             if not candidates_sl.empty:
                 sl = candidates_sl.min()
+                # Cap SL: never more than 2*ATR away
+                sl = min(sl, entry + (atr * 2))
             else:
-                sl = entry + atr
+                sl = entry + (atr * 1.5)
     else:
         # Non-forex: fallback to ATR distances
         if final_signal == "BUY":
