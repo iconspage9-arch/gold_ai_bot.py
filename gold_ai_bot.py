@@ -16,54 +16,52 @@ from flask import Flask
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 TIMEFRAMES = {"M30": "30m", "H1": "60m", "H4": "4h"}
 
-# Available trading pairs
-PAIRS = {
-    # Commodities
-    "GOLD": "GC=F",
-    "SILVER": "SI=F",
-    "OIL": "CL=F",
-    "COPPER": "HG=F",
-    "NATGAS": "NG=F",
-    
-    # Forex
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "JPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "NZDUSD": "NZDUSD=X",
-    "USDCAD": "USDCAD=X",
-    "USDCHF": "USDCHF=X",
-    "EURGBP": "EURGBP=X",
-    "EURGBP": "EURGBP=X",
-    "EURCHF": "EURCHF=X",
-    "GBPJPY": "GBPJPY=X",
-    "AUDJPY": "AUDJPY=X",
-    
-    # Crypto
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
-    "LTCUSD": "LTC-USD",
-    "XRPUSD": "XRP-USD",
-    "ADAUSD": "ADA-USD",
-    "DOGEUSD": "DOGE-USD",
-    "BNBUSD": "BNB-USD",
-    "SOLUSD": "SOL-USD",
-    "POLKAUSD": "DOT-USD",
-    "LINKUSD": "LINK-USD",
-    
-    # Indices
-    "SP500": "^GSPC",
-    "DOWJONES": "^DJI",
-    "NASDAQ": "^IXIC",
-    "DAX": "^GDAXI",
-    "FTSE": "^FTSE",
-    "NIKKEI": "^N225",
-    "HSI": "^HSI",
-    
-    # Forex Cross Rates
-    "EUJPY": "EURJPY=X",
-    "CADCHF": "CADCHF=X",
+# Available trading pairs organized by type
+PAIRS_BY_TYPE = {
+    "COMMODITIES": {
+        "GOLD": "GC=F",
+        "SILVER": "SI=F",
+        "OIL": "CL=F",
+        "COPPER": "HG=F",
+        "NATGAS": "NG=F"
+    },
+    "FOREX": {
+        "USD": ["EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"],
+        "EUR": ["USD", "GBP", "CHF", "JPY"],
+        "GBP": ["USD", "JPY"],
+        "AUD": ["USD", "JPY"],
+        "NZD": ["USD"],
+        "CAD": ["USD", "CHF"],
+        "CHF": ["USD", "EUR", "CAD"],
+        "JPY": ["USD", "EUR", "GBP", "AUD"]
+    },
+    "CRYPTO": {
+        "BTC": "BTC-USD",
+        "ETH": "ETH-USD",
+        "LTC": "LTC-USD",
+        "XRP": "XRP-USD",
+        "ADA": "ADA-USD",
+        "DOGE": "DOGE-USD",
+        "BNB": "BNB-USD",
+        "SOL": "SOL-USD",
+        "POLKA": "DOT-USD",
+        "LINK": "LINK-USD"
+    },
+    "INDICES": {
+        "SP500": "^GSPC",
+        "DOWJONES": "^DJI",
+        "NASDAQ": "^IXIC",
+        "DAX": "^GDAXI",
+        "FTSE": "^FTSE",
+        "NIKKEI": "^N225",
+        "HSI": "^HSI"
+    }
 }
+
+# Helper function to build forex pair symbol
+def build_forex_symbol(base, quote):
+    """Convert base/quote to yfinance symbol (e.g., USD+GBP -> USDGBP=X)"""
+    return f"{base}{quote}=X"
 
 # ================= DATA FUNCTIONS =================
 def fetch(tf, symbol="GC=F"):
@@ -168,8 +166,7 @@ def analyze(df):
     }
 
 # ================= TELEGRAM =================
-async def send_signal(update: Update, choice, symbol="GC=F"):
-    pair_name = [k for k, v in PAIRS.items() if v == symbol][0] if symbol in PAIRS.values() else symbol
+async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
     
     if choice == "MULTI":
         df_h4 = fetch(TIMEFRAMES["H4"], symbol)
@@ -206,27 +203,87 @@ async def send_signal(update: Update, choice, symbol="GC=F"):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower()
-    if text == "start":
-        kb = [list(PAIRS.keys())]
+    text = update.message.text.strip()
+    user_data = context.user_data
+    
+    # Step 1: Start - ask for type
+    if text.lower() == "start":
+        kb = [["COMMODITIES", "FOREX", "CRYPTO", "INDICES"]]
         await update.message.reply_text(
-            "Choose a pair:",
+            "Choose pair type:",
             reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
         )
+        user_data.clear()
         return
-    if text.upper() in PAIRS:
-        context.user_data["selected_pair"] = PAIRS[text.upper()]
-        kb = [["M30","H1","H4","MULTI"]]
-        await update.message.reply_text(
-            f"Pair: {text.upper()} - Choose timeframe:",
-            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-        )
+    
+    # Step 2: Type selected - ask for base/pair
+    if text.upper() in PAIRS_BY_TYPE and "type" not in user_data:
+        user_data["type"] = text.upper()
+        pair_type = user_data["type"]
+        
+        if pair_type == "FOREX":
+            bases = list(PAIRS_BY_TYPE["FOREX"].keys())
+            kb = [bases[i:i+3] for i in range(0, len(bases), 3)]  # 3 per row
+            await update.message.reply_text(
+                "Choose base currency:",
+                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+            )
+        else:
+            # Commodities, Crypto, Indices - show all options
+            pairs = list(PAIRS_BY_TYPE[pair_type].keys())
+            kb = [pairs[i:i+3] for i in range(0, len(pairs), 3)]
+            await update.message.reply_text(
+                f"Choose {pair_type.lower()}:",
+                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+            )
         return
-    if text.upper() in TIMEFRAMES or text.upper() == "MULTI":
-        symbol = context.user_data.get("selected_pair", "GC=F")
-        await send_signal(update, text.upper(), symbol)
+    
+    # Step 3: Forex - base selected, ask for quote
+    if user_data.get("type") == "FOREX" and "base" not in user_data:
+        if text.upper() in PAIRS_BY_TYPE["FOREX"]:
+            user_data["base"] = text.upper()
+            quotes = PAIRS_BY_TYPE["FOREX"][user_data["base"]]
+            kb = [quotes[i:i+3] for i in range(0, len(quotes), 3)]
+            await update.message.reply_text(
+                f"Choose quote currency for {user_data['base']}:",
+                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+            )
+            return
+    
+    # Step 4: Forex - quote selected, build symbol
+    if user_data.get("type") == "FOREX" and user_data.get("base") and "pair" not in user_data:
+        if text.upper() in PAIRS_BY_TYPE["FOREX"][user_data["base"]]:
+            user_data["quote"] = text.upper()
+            symbol = build_forex_symbol(user_data["base"], user_data["quote"])
+            user_data["pair"] = symbol
+            user_data["pair_name"] = f"{user_data['base']}{user_data['quote']}"
+            ask_for_timeframe(update)
+            return
+    
+    # Step 3 (non-Forex): Pair selected directly
+    if user_data.get("type") in ["COMMODITIES", "CRYPTO", "INDICES"] and "pair" not in user_data:
+        pair_type = user_data["type"]
+        if text.upper() in PAIRS_BY_TYPE[pair_type]:
+            user_data["pair_name"] = text.upper()
+            user_data["pair"] = PAIRS_BY_TYPE[pair_type][text.upper()]
+            ask_for_timeframe(update)
+            return
+    
+    # Step 5: Timeframe selected - analyze and send signal
+    if user_data.get("pair") and text.upper() in TIMEFRAMES or text.upper() == "MULTI":
+        symbol = user_data["pair"]
+        pair_name = user_data["pair_name"]
+        await send_signal(update, text.upper(), symbol, pair_name)
         return
-    await update.message.reply_text("Type *start* to begin.", parse_mode="Markdown")
+    
+    await update.message.reply_text("Invalid input. Type *start* to begin.", parse_mode="Markdown")
+
+async def ask_for_timeframe(update: Update):
+    kb = [["M30","H1","H4","MULTI"]]
+    await update.message.reply_text(
+        "Choose timeframe:",
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
+    )
 
 # ================= TELEGRAM BOT SETUP =================
 app_bot = ApplicationBuilder().token(TOKEN).build()
