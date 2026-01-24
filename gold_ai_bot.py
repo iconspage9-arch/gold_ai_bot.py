@@ -58,10 +58,31 @@ PAIRS_BY_TYPE = {
     }
 }
 
-# Helper function to build forex pair symbol
-def build_forex_symbol(base, quote):
-    """Convert base/quote to yfinance symbol (e.g., USD+GBP -> USDGBP=X)"""
-    return f"{base}{quote}=X"
+# Helper function to detect swing highs and lows
+def find_swing_levels(df, lookback=20):
+    """Find actual swing highs and lows (local extremes)"""
+    if len(df) < 5:
+        return [], []
+    
+    highs = []
+    lows = []
+    recent = df.iloc[-lookback:] if len(df) >= lookback else df
+    
+    for i in range(1, len(recent) - 1):
+        if recent['High'].iloc[i] > recent['High'].iloc[i-1] and recent['High'].iloc[i] > recent['High'].iloc[i+1]:
+            highs.append(recent['High'].iloc[i])
+        if recent['Low'].iloc[i] < recent['Low'].iloc[i-1] and recent['Low'].iloc[i] < recent['Low'].iloc[i+1]:
+            lows.append(recent['Low'].iloc[i])
+    
+    return highs, lows
+
+# Helper function to convert pips to decimal
+def pips_to_decimal(pair_name, pips):
+    """Convert pips to decimal price movement"""
+    if "JPY" in pair_name:
+        return pips * 0.01  # JPY pairs = 2 decimals
+    else:
+        return pips * 0.0001  # Standard pairs = 4 decimals
 
 # ================= DATA FUNCTIONS =================
 def fetch(tf, symbol="GC=F"):
@@ -148,54 +169,101 @@ def analyze(df, symbol=None):
     atr = last.atr if pd.notna(last.atr) else 0
     entry = last.Close
 
-    # Forex-specific: use recent highs/lows and consolidation zones for TP/SL
+    # Forex-specific: use multi-factor approach
     is_forex = False
     if isinstance(symbol, str) and symbol.endswith("=X"):
         is_forex = True
 
     if is_forex:
-        lookback = min(len(df) - 1, 50)
-        prev_highs = df['High'].iloc[-(lookback+1):-1] if lookback > 0 else pd.Series(dtype=float)
-        prev_lows = df['Low'].iloc[-(lookback+1):-1] if lookback > 0 else pd.Series(dtype=float)
-        range_window = min(len(df), 20)
+        entry = last.Close
+        
+        # Factor 1: Swing highs/lows (actual turning points)
+        swing_highs, swing_lows = find_swing_levels(df, lookback=20)
+        
+        # Factor 2: Recent highs/lows (tighter window)
+        range_window = min(len(df), 15)
         recent_high = df['High'].iloc[-range_window:].max()
         recent_low = df['Low'].iloc[-range_window:].min()
+        
+        # Factor 3: Risk/Reward ratio (1:2)
+        # SL will be X pips, TP will be 2X pips
+        
+        # Factor 4: Fixed pip distances (fallback)
+        # 50 pips SL, 100 pips TP for standard pairs
+        # 5 pips SL, 10 pips TP for JPY pairs
+        pair_name_str = str(symbol)
+        is_jpy = "JPY" in pair_name_str
+        if is_jpy:
+            pip_sl = 5
+            pip_tp = 10
+        else:
+            pip_sl = 50
+            pip_tp = 100
+        
+        # Factor 5: Multi-timeframe confirmation (use recent levels as anchors)
         consolidation = False
         if atr > 0 and (recent_high - recent_low) < (atr * 1.5):
             consolidation = True
 
         if final_signal == "BUY":
-            candidates_tp = prev_highs[prev_highs > entry]
-            if consolidation:
+            # TP: prefer swing high, else recent high, else entry + 2x pip distance
+            if swing_highs:
+                candidates = [h for h in swing_highs if h > entry]
+                if candidates:
+                    tp_swing = min(candidates)  # Nearest swing high
+                    tp = tp_swing
+                else:
+                    tp = entry + pips_to_decimal(pair_name_str, pip_tp)
+            elif consolidation:
                 tp = recent_high
-            elif not candidates_tp.empty:
-                tp = candidates_tp.min()
             else:
-                tp = entry + (atr * 2)
+                tp = entry + pips_to_decimal(pair_name_str, pip_tp)
 
-            candidates_sl = prev_lows[prev_lows < entry]
-            if not candidates_sl.empty:
-                sl = candidates_sl.max()
-                # Cap SL: never more than 2*ATR away
-                sl = max(sl, entry - (atr * 2))
+            # SL: prefer swing low, else recent low, else entry - 1x pip distance
+            if swing_lows:
+                candidates = [l for l in swing_lows if l < entry]
+                if candidates:
+                    sl_swing = max(candidates)  # Nearest swing low
+                    sl = max(sl_swing, entry - pips_to_decimal(pair_name_str, pip_sl))
+                else:
+                    sl = entry - pips_to_decimal(pair_name_str, pip_sl)
             else:
-                sl = entry - (atr * 1.5)
+                sl = max(recent_low, entry - pips_to_decimal(pair_name_str, pip_sl))
+            
+            # Enforce risk/reward: TP must be at least 2x SL distance
+            tp_distance = tp - entry
+            sl_distance = entry - sl
+            if tp_distance < sl_distance * 2 and atr > 0:
+                tp = entry + (sl_distance * 2)
         else:
-            candidates_tp = prev_lows[prev_lows < entry]
-            if consolidation:
+            # SELL
+            if swing_lows:
+                candidates = [l for l in swing_lows if l < entry]
+                if candidates:
+                    tp_swing = max(candidates)  # Nearest swing low
+                    tp = tp_swing
+                else:
+                    tp = entry - pips_to_decimal(pair_name_str, pip_tp)
+            elif consolidation:
                 tp = recent_low
-            elif not candidates_tp.empty:
-                tp = candidates_tp.max()
             else:
-                tp = entry - (atr * 2)
+                tp = entry - pips_to_decimal(pair_name_str, pip_tp)
 
-            candidates_sl = prev_highs[prev_highs > entry]
-            if not candidates_sl.empty:
-                sl = candidates_sl.min()
-                # Cap SL: never more than 2*ATR away
-                sl = min(sl, entry + (atr * 2))
+            if swing_highs:
+                candidates = [h for h in swing_highs if h > entry]
+                if candidates:
+                    sl_swing = min(candidates)  # Nearest swing high
+                    sl = min(sl_swing, entry + pips_to_decimal(pair_name_str, pip_sl))
+                else:
+                    sl = entry + pips_to_decimal(pair_name_str, pip_sl)
             else:
-                sl = entry + (atr * 1.5)
+                sl = min(recent_high, entry + pips_to_decimal(pair_name_str, pip_sl))
+            
+            # Enforce risk/reward: TP must be at least 2x SL distance
+            tp_distance = entry - tp
+            sl_distance = sl - entry
+            if tp_distance < sl_distance * 2 and atr > 0:
+                tp = entry - (sl_distance * 2)
     else:
         # Non-forex: fallback to ATR distances
         if final_signal == "BUY":
