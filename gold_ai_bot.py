@@ -61,6 +61,9 @@ PAIRS_BY_TYPE = {
     }
 }
 
+# ================= UTILITIES =================
+file_lock = threading.Lock()
+
 # Helper function to detect swing highs and lows
 def find_swing_levels(df, lookback=20):
     """Find actual swing highs and lows (local extremes)"""
@@ -259,12 +262,14 @@ def detect_patterns(df):
     
     # Triangle: contracting high/low range
     if len(recent) >= 20:
-        high_range = recent['High'].iloc[-20:].max() - recent['High'].iloc[-20:].min()
-        low_range = recent['Low'].iloc[-20:].max() - recent['Low'].iloc[-20:].min()
-        curr_high = recent['High'].iloc[-10:].max() - recent['High'].iloc[-10:].min()
-        curr_low = recent['Low'].iloc[-10:].max() - recent['Low'].iloc[-10:].min()
+        high_20 = recent['High'].iloc[-20:]
+        low_20 = recent['Low'].iloc[-20:]
+        total_high_range = high_20.max() - high_20.min()
+        total_low_range = low_20.max() - low_20.min()
+        curr_high_range = recent['High'].iloc[-10:].max() - recent['High'].iloc[-10:].min()
+        curr_low_range = recent['Low'].iloc[-10:].max() - recent['Low'].iloc[-10:].min()
         
-        if curr_high < high_range * 0.5 and curr_low < low_range * 0.5:
+        if curr_high_range < total_high_range * 0.5 and curr_low_range < total_low_range * 0.5:
             patterns.append("TRIANGLE")
     
     # Head & Shoulders: peak-valley-peak with middle peak highest
@@ -279,39 +284,42 @@ def detect_patterns(df):
     
     # Wedge: converging trend lines (ascending or descending)
     if len(recent) >= 20:
-        highs_range = recent['High'].iloc[-20:].max() - recent['High'].iloc[-10:].max()
-        lows_range = recent['Low'].iloc[-20:].min() - recent['Low'].iloc[-10:].min()
+        total_high_range = recent['High'].iloc[-20:].max() - recent['High'].iloc[-20:].min()
+        total_low_range = recent['Low'].iloc[-20:].max() - recent['Low'].iloc[-20:].min()
+        recent_high_range = recent['High'].iloc[-10:].max() - recent['High'].iloc[-10:].min()
+        recent_low_range = recent['Low'].iloc[-10:].max() - recent['Low'].iloc[-10:].min()
         
         # Ascending wedge: higher lows, converging highs
-        if lows_range > 0 and highs_range < lows_range * 0.3:
-            patterns.append("WEDGE_ASCENDING")
-        # Descending wedge: lower highs, converging lows
-        elif highs_range < 0 and abs(lows_range) < abs(highs_range) * 0.3:
-            patterns.append("WEDGE_DESCENDING")
+        if recent_low_range < total_low_range * 0.5 and recent_high_range < total_high_range * 0.5:
+            # Use simple heuristic; more robust implementation would fit lines
+            patterns.append("WEDGE")
     
     # Cup & Handle: U-shaped recovery with small pullback
     if len(recent) >= 30:
-        low_idx = recent['Low'].iloc[-30:].argmin()  # Get position, not label
-        left_high = recent['High'].iloc[-30:low_idx].max() if low_idx > 0 else 0
-        right_high = recent['High'].iloc[low_idx:].max()
+        block = recent.iloc[-30:]
+        low_pos = int(block['Low'].argmin())  # 0..29
+        left_high = block['High'].iloc[:low_pos].max() if low_pos > 0 else np.nan
+        right_high = block['High'].iloc[low_pos:].max()
         
-        if left_high and abs(left_high - right_high) / left_high < 0.02 and left_high > recent['Low'].iloc[-1]:
-            # Check for handle (small pullback)
-            handle_low = recent['Low'].iloc[-5:].min()
-            if handle_low > recent['Low'].iloc[low_idx]:
-                patterns.append("CUP_HANDLE")
+        if not np.isnan(left_high) and left_high > 0:
+            if abs(left_high - right_high) / left_high < 0.02 and left_high > block['Low'].iloc[-1]:
+                # Check for handle (small pullback)
+                handle_low = block['Low'].iloc[-5:].min()
+                if handle_low > block['Low'].iloc[low_pos]:
+                    patterns.append("CUP_HANDLE")
     
     # Flag: small consolidation after strong directional move
     if len(recent) >= 25:
         early = recent.iloc[-25:-15]
         recent_part = recent.iloc[-15:]
         
-        early_range = (early['High'].max() - early['Low'].min()) / early['Close'].mean()
-        recent_range = (recent_part['High'].max() - recent_part['Low'].min()) / recent_part['Close'].mean()
-        
-        # Consolidation is much tighter than prior move
-        if recent_range < early_range * 0.4:
-            patterns.append("FLAG")
+        if len(early) > 0 and len(recent_part) > 0:
+            early_range = (early['High'].max() - early['Low'].min()) / early['Close'].mean()
+            recent_range = (recent_part['High'].max() - recent_part['Low'].min()) / recent_part['Close'].mean()
+            
+            # Consolidation is much tighter than prior move
+            if recent_range < early_range * 0.4:
+                patterns.append("FLAG")
     
     return patterns
 
@@ -320,29 +328,35 @@ def load_trades():
     """Load trade history from file"""
     if os.path.exists(TRADE_HISTORY_FILE):
         with open(TRADE_HISTORY_FILE, 'r') as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except Exception:
+                return []
     return []
 
 def save_trade(pair, signal, tp, sl, entry):
     """Log a new trade signal"""
-    trades = load_trades()
-    trade = {
-        "timestamp": datetime.now().isoformat(),
-        "pair": pair,
-        "signal": signal,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "status": "OPEN"
-    }
-    trades.append(trade)
-    with open(TRADE_HISTORY_FILE, 'w') as f:
-        json.dump(trades, f, indent=2)
+    with file_lock:
+        trades = load_trades()
+        trade = {
+            "timestamp": datetime.now().isoformat(),
+            "pair": pair,
+            "signal": signal,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "status": "OPEN"
+        }
+        trades.append(trade)
+        tmp = TRADE_HISTORY_FILE + ".tmp"
+        with open(tmp, 'w') as f:
+            json.dump(trades, f, indent=2)
+        os.replace(tmp, TRADE_HISTORY_FILE)
 
 def get_win_rate():
     """Calculate bot's win rate from closed trades"""
     trades = load_trades()
-    closed = [t for t in trades if t["status"] != "OPEN"]
+    closed = [t for t in trades if t.get("status") and t["status"] != "OPEN"]
     if not closed:
         return None
     
@@ -356,7 +370,15 @@ def get_win_rate():
 
 # ================= FEATURE: BACKTESTING =================
 def backtest_strategy(symbol, timeframe="H1", days=30):
-    """Backtest strategy where every valid signal is taken, even if a previous trade is still open"""
+    """Backtest strategy where every valid signal is taken, even if a previous trade is still open.
+
+    This version fixes TP/SL logic for SELL trades, skips iterations with NaN indicators,
+    and uses explicit buy/sell TP/SL variables for clarity.
+
+    This keeps your original approach (checking TP/SL hits inside the same candle).
+    If you want multi-candle trade tracking (hold until TP/SL hit in subsequent candles),
+    I can extend the function to simulate trade durations.
+    """
     try:
         df = yf.download(symbol, period=f"{days}d", interval=timeframe, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -368,7 +390,7 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
         
         wins = 0
         losses = 0
-        total_profit = 0
+        total_profit = 0.0
         total_trades = 0
         
         # Indicators
@@ -377,30 +399,45 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
         rsi = RSIIndicator(df["Close"], 14).rsi()
         
         for i in range(1, len(df)):
-            buy_signal = ema_short.iloc[i] > ema_long.iloc[i] and rsi.iloc[i] < 70
-            sell_signal = ema_short.iloc[i] < ema_long.iloc[i] and rsi.iloc[i] > 30
+            # skip if any required indicator is NaN for this index
+            if pd.isna(ema_short.iloc[i]) or pd.isna(ema_long.iloc[i]) or pd.isna(rsi.iloc[i]):
+                continue
+
+            buy_signal = (ema_short.iloc[i] > ema_long.iloc[i]) and (rsi.iloc[i] < 70)
+            sell_signal = (ema_short.iloc[i] < ema_long.iloc[i]) and (rsi.iloc[i] > 30)
             
             entry_price = df["Close"].iloc[i]
-            tp_price = entry_price * 1.015
-            sl_price = entry_price * 0.985
+            # Define TP/SL explicitly for buy and sell directions
+            buy_tp = entry_price * 1.015
+            buy_sl = entry_price * 0.985
+            sell_tp = entry_price * 0.985
+            sell_sl = entry_price * 1.015
             
+            # Evaluate buy signal outcome within the same candle
             if buy_signal:
                 total_trades += 1
-                if df["High"].iloc[i] >= tp_price:
+                # If high reaches buy TP -> win
+                if df["High"].iloc[i] >= buy_tp:
                     wins += 1
                     total_profit += entry_price * 0.015
-                elif df["Low"].iloc[i] <= sl_price:
+                # Else if low reaches buy SL -> loss
+                elif df["Low"].iloc[i] <= buy_sl:
                     losses += 1
                     total_profit -= entry_price * 0.015
+                # else: no resolution within candle => treated as unresolved (no P/L)
             
+            # Evaluate sell signal outcome within the same candle
             if sell_signal:
                 total_trades += 1
-                if df["Low"].iloc[i] <= sl_price:
+                # For sell, TP is below entry: low reaching sell_tp -> win
+                if df["Low"].iloc[i] <= sell_tp:
                     wins += 1
                     total_profit += entry_price * 0.015
-                elif df["High"].iloc[i] >= tp_price:
+                # Else if high reaches sell SL -> loss
+                elif df["High"].iloc[i] >= sell_sl:
                     losses += 1
                     total_profit -= entry_price * 0.015
+                # else: unresolved within candle
         
         return {
             "total_trades": total_trades,
@@ -413,36 +450,45 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
         print(f"Backtest error: {e}")
         return None
 
-
 # ================= FEATURE: TRADE JOURNAL =================
 def log_journal(pair, signal, tp, sl, entry, note):
     """Log trade to personal journal with notes"""
-    journal = []
-    if os.path.exists(JOURNAL_FILE):
-        with open(JOURNAL_FILE, 'r') as f:
-            journal = json.load(f)
-    
-    entry_log = {
-        "timestamp": datetime.now().isoformat(),
-        "pair": pair,
-        "signal": signal,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "user_note": note
-    }
-    journal.append(entry_log)
-    with open(JOURNAL_FILE, 'w') as f:
-        json.dump(journal, f, indent=2)
+    with file_lock:
+        journal = []
+        if os.path.exists(JOURNAL_FILE):
+            try:
+                with open(JOURNAL_FILE, 'r') as f:
+                    journal = json.load(f)
+            except Exception:
+                journal = []
+        
+        entry_log = {
+            "timestamp": datetime.now().isoformat(),
+            "pair": pair,
+            "signal": signal,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "user_note": note
+        }
+        journal.append(entry_log)
+        tmp = JOURNAL_FILE + ".tmp"
+        with open(tmp, 'w') as f:
+            json.dump(journal, f, indent=2)
+        os.replace(tmp, JOURNAL_FILE)
 
 def get_journal_entries(limit=5):
     """Get recent journal entries"""
     if os.path.exists(JOURNAL_FILE):
         with open(JOURNAL_FILE, 'r') as f:
-            journal = json.load(f)
+            try:
+                journal = json.load(f)
+            except Exception:
+                journal = []
         return journal[-limit:] if journal else []
     return []
 
+# ================= ANALYSIS =================
 def analyze(df, symbol=None):
     if df is None or len(df) == 0:
         return None
@@ -452,9 +498,9 @@ def analyze(df, symbol=None):
     
     # Signal 1: EMA Trend (50/200 crossover)
     # Handle missing ema200: use fallback
-    ema200_val = getattr(last, 'ema200', np.nan)
+    ema200_val = last.get('ema200', np.nan) if hasattr(last, "get") else np.nan
     if pd.notna(ema200_val):
-        ema_signal = "BUY" if last.ema50 > last.ema200 else "SELL"
+        ema_signal = "BUY" if last.ema50 > ema200_val else "SELL"
     else:
         # Fallback: compare ema50 to price if ema200 not available
         ema_signal = "BUY" if last.ema50 > last.Close else "SELL"
@@ -533,12 +579,7 @@ def analyze(df, symbol=None):
         recent_high = df['High'].iloc[-range_window:].max()
         recent_low = df['Low'].iloc[-range_window:].min()
         
-        # Factor 3: Risk/Reward ratio (1:2)
-        # SL will be X pips, TP will be 2X pips
-        
         # Factor 4: Fixed pip distances (fallback)
-        # 50 pips SL, 100 pips TP for standard pairs
-        # 5 pips SL, 10 pips TP for JPY pairs
         pair_name_str = str(symbol)
         is_jpy = "JPY" in pair_name_str
         if is_jpy:
@@ -625,12 +666,12 @@ def analyze(df, symbol=None):
         "signal": final_signal,
         "agreement": agreement,
         "ema": ema_signal,
-        "rsi": round(last.rsi, 2),
+        "rsi": round(last.rsi, 2) if pd.notna(last.rsi) else None,
         "macd": "UP" if last.macd > last.macd_signal else "DOWN",
         "bb": bb_signal,
-        "stoch": round(last.stoch_k, 2) if pd.notna(last.stoch_k) else 0,
-        "tp": round(tp, 2),
-        "sl": round(sl, 2),
+        "stoch": round(last.stoch_k, 2) if pd.notna(last.stoch_k) else None,
+        "tp": round(tp, 5) if tp is not None else None,
+        "sl": round(sl, 5) if sl is not None else None,
         "divergence": divergence,
         "patterns": patterns,
         "fib_levels": {k: round(v, 5) for k, v in fib_levels.items()}
@@ -680,8 +721,8 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         dec = 5
 
     entry_s = f"${price:.{dec}f}"
-    tp_s = f"${sigs['tp']:.{dec}f}"
-    sl_s = f"${sigs['sl']:.{dec}f}"
+    tp_s = f"${sigs['tp']:.{dec}f}" if sigs['tp'] is not None else "N/A"
+    sl_s = f"${sigs['sl']:.{dec}f}" if sigs['sl'] is not None else "N/A"
     
     # Build message with all features
     div_text = ""
@@ -803,7 +844,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pair = user_data.get("backtest_pair", "BTC-USD")
             try:
                 await update.message.reply_text(f"⏳ Running backtest on {days}d {pair}...")
-                result = backtest_strategy(pair, "1h", days)
+                result = backtest_strategy(pair, "60m", days)
                 if result and result['total_trades'] > 0:
                     msg = (f"✅ BACKTEST COMPLETE ({days}d {pair} H1):\n\n"
                            f"💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n"
@@ -889,10 +930,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
             user_data["stage"] = "main_menu"
             return
-    
-
 
 # ================= TELEGRAM BOT SETUP =================
+if not TOKEN:
+    raise RuntimeError("Environment variable TELEGRAM_TOKEN is required to run the bot.")
+
 app_bot = ApplicationBuilder().token(TOKEN).build()
 app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
