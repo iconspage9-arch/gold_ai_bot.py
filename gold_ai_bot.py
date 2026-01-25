@@ -664,136 +664,124 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_data = context.user_data
     
-    # Commands FIRST (always check these before pair selection)
-    if text.lower() == "/history":
-        try:
-            wr = get_win_rate()
-            if wr and wr['total_trades'] > 0:
-                msg = f"📈 WIN RATE:\n✅ Wins: {wr['wins']}\n❌ Losses: {wr['losses']}\nTotal: {wr['total_trades']}\n📊 Rate: {wr['win_rate']:.1f}%"
-            else:
-                msg = "No closed trades yet."
-        except Exception as e:
-            msg = f"Error: {str(e)}"
-        await update.message.reply_text(msg)
-        return
-    
-    if text.lower() == "/backtest":
-        try:
-            await update.message.reply_text("⏳ Running backtest... (this may take 10-15 seconds)")
-            result = backtest_strategy("BTC-USD", "1h", 7)  # Reduced to 7 days for speed
-            if result and result['total_trades'] > 0:
-                msg = f"🔬 BACKTEST (7d BTC H1):\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Win Rate: {result['win_rate']:.1f}%\n💵 P&L: ${result['total_profit']:.4f}"
-            else:
-                msg = "Backtest: insufficient data or no trades."
-        except Exception as e:
-            msg = f"Backtest error: {str(e)}"
-        await update.message.reply_text(msg)
-        return
-    
-    if text.lower().startswith("/journal"):
-        try:
-            entries = get_journal_entries(5)
-            if entries:
-                msg = "📔 TRADE JOURNAL (Last 5):\n"
-                for e in entries:
-                    msg += f"\n{e['pair']} {e['signal']} @ ${e['entry']:.5f}\nNote: {e['user_note']}\n"
-            else:
-                msg = "No journal entries yet."
-        except Exception as e:
-            msg = f"Journal error: {str(e)}"
-        await update.message.reply_text(msg)
-        return
-    
-    if text.lower().startswith("/note "):
-        try:
-            note = text[6:].strip()
-            if user_data.get("pair"):
-                log_journal(user_data.get("pair_name", "Unknown"), "USER_NOTE", 0, 0, 0, note)
-                await update.message.reply_text("✅ Note logged!")
-            else:
-                await update.message.reply_text("⚠️ Select a pair first, then use /note")
-        except Exception as e:
-            await update.message.reply_text(f"Note error: {str(e)}")
-        return
-    
-    # Step 1: Start - ask for type
-    if text.lower() == "start":
-        kb = [["COMMODITIES", "FOREX", "CRYPTO", "INDICES"]]
+    # Step 1: START - Show main menu
+    if text.lower() == "/start" or text.lower() == "start":
+        kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
         await update.message.reply_text(
-            "Choose pair type:\n\n/history - Win rate\n/backtest - Test strategy\n/journal - Trade notes\n/note [text] - Log note",
+            "🤖 Trading Bot Menu:\n\nChoose an option:",
             reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
         )
         user_data.clear()
+        user_data["stage"] = "main_menu"
         return
     
-    # Step 2: Type selected - ask for base/pair
-    if text.upper() in PAIRS_BY_TYPE and "type" not in user_data:
-        user_data["type"] = text.upper()
-        pair_type = user_data["type"]
+    # Step 2: MAIN MENU - User chose an option
+    if user_data.get("stage") == "main_menu":
+        if text == "Trade History":
+            try:
+                wr = get_win_rate()
+                if wr and wr['total_trades'] > 0:
+                    msg = f"📈 WIN RATE:\n✅ Wins: {wr['wins']}\n❌ Losses: {wr['losses']}\nTotal: {wr['total_trades']}\n📊 Rate: {wr['win_rate']:.1f}%"
+                else:
+                    msg = "❌ No closed trades yet."
+            except Exception as e:
+                msg = f"❌ Error: {str(e)}"
+            await update.message.reply_text(msg)
+            kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+            await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            return
         
-        if pair_type == "FOREX":
-            bases = list(PAIRS_BY_TYPE["FOREX"].keys())
-            kb = [bases[i:i+3] for i in range(0, len(bases), 3)]  # 3 per row
-            await update.message.reply_text(
-                "Choose base currency:",
-                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-            )
-        else:
-            # Commodities, Crypto, Indices - show all options
-            pairs = list(PAIRS_BY_TYPE[pair_type].keys())
-            kb = [pairs[i:i+3] for i in range(0, len(pairs), 3)]
-            await update.message.reply_text(
-                f"Choose {pair_type.lower()}:",
-                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-            )
+        if text == "Backtest":
+            try:
+                await update.message.reply_text("⏳ Running backtest on 7 days BTC data...")
+                result = backtest_strategy("BTC-USD", "1h", 7)
+                if result and result['total_trades'] > 0:
+                    msg = f"✅ BACKTEST COMPLETE (7d BTC-USD H1):\n\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Win Rate: {result['win_rate']:.1f}%\n💵 P&L: ${result['total_profit']:.4f}"
+                else:
+                    msg = "❌ Backtest: No trades found"
+            except Exception as e:
+                msg = f"❌ Backtest error: {str(e)}"
+            await update.message.reply_text(msg)
+            kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+            await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            return
+        
+        if text == "Make Note":
+            await update.message.reply_text("📝 Type your note:")
+            user_data["stage"] = "waiting_for_note"
+            return
+        
+        if text == "Get Signal":
+            kb = [["COMMODITIES", "FOREX"], ["CRYPTO", "INDICES"]]
+            await update.message.reply_text("Choose pair type:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            user_data["stage"] = "choosing_type"
+            return
+    
+    # Step 3: WAITING FOR NOTE
+    if user_data.get("stage") == "waiting_for_note":
+        note = text
+        try:
+            log_journal("Manual Note", "USER_NOTE", 0, 0, 0, note)
+            await update.message.reply_text("✅ Note saved!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error saving note: {str(e)}")
+        kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+        await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+        user_data["stage"] = "main_menu"
         return
     
-    # Step 3: Forex - base selected, ask for quote
-    if user_data.get("type") == "FOREX" and "base" not in user_data:
-        if text.upper() in PAIRS_BY_TYPE["FOREX"]:
-            user_data["base"] = text.upper()
-            quotes = PAIRS_BY_TYPE["FOREX"][user_data["base"]]
-            kb = [quotes[i:i+3] for i in range(0, len(quotes), 3)]
-            await update.message.reply_text(
-                f"Choose quote currency for {user_data['base']}:",
-                reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-            )
+    # Step 4: CHOOSING TYPE - for Get Signal
+    if user_data.get("stage") == "choosing_type":
+        if text.upper() in PAIRS_BY_TYPE:
+            user_data["type"] = text.upper()
+            pairs = PAIRS_BY_TYPE[text.upper()]
+            kb = [[p] for p in pairs[:4]]  # Show first 4
+            await update.message.reply_text(f"Choose {text} pair:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            user_data["stage"] = "choosing_pair"
             return
     
-    # Step 4: Forex - quote selected, build symbol
-    if user_data.get("type") == "FOREX" and user_data.get("base") and "pair" not in user_data:
-        if text.upper() in PAIRS_BY_TYPE["FOREX"][user_data["base"]]:
-            user_data["quote"] = text.upper()
-            symbol = build_forex_symbol(user_data["base"], user_data["quote"])
-            user_data["pair"] = symbol
-            user_data["pair_name"] = f"{user_data['base']}{user_data['quote']}"
-            await ask_for_timeframe(update)
+    # Step 5: CHOOSING PAIR
+    if user_data.get("stage") == "choosing_pair":
+        pair_type = user_data.get("type", "COMMODITIES")
+        if text in PAIRS_BY_TYPE.get(pair_type, []):
+            user_data["pair"] = text
+            
+            # For FOREX, ask for timeframe
+            if pair_type == "FOREX":
+                kb = [["M30", "H1"], ["H4", "D1"]]
+                await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+                user_data["stage"] = "choosing_timeframe"
+            else:
+                # For others, ask timeframe directly
+                kb = [["M30", "H1"], ["H4", "D1"]]
+                await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+                user_data["stage"] = "choosing_timeframe"
             return
     
-    # Step 3 (non-Forex): Pair selected directly
-    if user_data.get("type") in ["COMMODITIES", "CRYPTO", "INDICES"] and "pair" not in user_data:
-        pair_type = user_data["type"]
-        if text.upper() in PAIRS_BY_TYPE[pair_type]:
-            user_data["pair_name"] = text.upper()
-            user_data["pair"] = PAIRS_BY_TYPE[pair_type][text.upper()]
-            await ask_for_timeframe(update)
+    # Step 6: CHOOSING TIMEFRAME
+    if user_data.get("stage") == "choosing_timeframe":
+        if text in ["M30", "H1", "H4", "D1"]:
+            user_data["timeframe"] = text
+            pair_type = user_data.get("type", "COMMODITIES")
+            pair = user_data.get("pair", "GC=F")
+            
+            try:
+                await update.message.reply_text("⏳ Analyzing... This may take 5-10 seconds...")
+                df = fetch(text, pair)
+                if df is not None and len(df) > 0:
+                    result = analyze(df, pair)
+                    await send_signal(update, pair_type, pair, pair)
+                else:
+                    await update.message.reply_text(f"❌ No data for {pair}")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error: {str(e)}")
+            
+            kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+            await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            user_data["stage"] = "main_menu"
             return
     
-    # Step 5: Timeframe selected - analyze and send signal
-    if user_data.get("pair") and text.upper() in TIMEFRAMES or text.upper() == "MULTI":
-        symbol = user_data["pair"]
-        pair_name = user_data["pair_name"]
-        await send_signal(update, text.upper(), symbol, pair_name)
-        return
-    
-    await update.message.reply_text("Invalid input. Type *start* to begin.", parse_mode="Markdown")
 
-async def ask_for_timeframe(update: Update):
-    kb = [["M30","H1","H4","MULTI"]]
-    await update.message.reply_text(
-        "Choose timeframe:",
-        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
-    )
 
 # ================= TELEGRAM BOT SETUP =================
 app_bot = ApplicationBuilder().token(TOKEN).build()
