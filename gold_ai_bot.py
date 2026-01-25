@@ -355,7 +355,7 @@ def get_win_rate():
     }
 
 # ================= FEATURE: BACKTESTING =================
-def backtest_strategy_allow_overlap(symbol, timeframe="H1", days=30):
+def backtest_strategy(symbol, timeframe="H1", days=30):
     """Backtest strategy where every valid signal is taken, even if a previous trade is still open"""
     try:
         df = yf.download(symbol, period=f"{days}d", interval=timeframe, progress=False)
