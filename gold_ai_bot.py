@@ -29,14 +29,13 @@ PAIRS_BY_TYPE = {
         "NATGAS": "NG=F"
     },
     "FOREX": {
-        "USD": ["EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"],
         "EUR": ["USD", "GBP", "CHF", "JPY"],
         "GBP": ["USD", "JPY"],
+        "JPY": ["USD", "EUR", "GBP", "AUD"],
         "AUD": ["USD", "JPY"],
         "NZD": ["USD"],
         "CAD": ["USD", "CHF"],
-        "CHF": ["USD", "EUR", "CAD"],
-        "JPY": ["USD", "EUR", "GBP", "AUD"]
+        "CHF": ["USD", "EUR", "CAD"]
     },
     "CRYPTO": {
         "BTC": "BTC-USD",
@@ -190,7 +189,7 @@ def calculate_fibonacci(high, low, direction="UP"):
 
 # ================= FEATURE: PATTERN RECOGNITION =================
 def detect_patterns(df):
-    """Detect chart patterns: double top/bottom, triangle, flag"""
+    """Detect chart patterns: double top/bottom, triangle, flag, head & shoulders, wedge, cup & handle"""
     if len(df) < 50:
         return []
     
@@ -228,6 +227,52 @@ def detect_patterns(df):
         
         if curr_high < high_range * 0.5 and curr_low < low_range * 0.5:
             patterns.append("TRIANGLE")
+    
+    # Head & Shoulders: peak-valley-peak with middle peak highest
+    if len(peaks) >= 3:
+        left_shoulder = peaks[-3]
+        head = peaks[-2]
+        right_shoulder = peaks[-1]
+        
+        if head[1] > left_shoulder[1] and head[1] > right_shoulder[1]:
+            if abs(left_shoulder[1] - right_shoulder[1]) / left_shoulder[1] < 0.03:
+                patterns.append("HEAD_SHOULDERS")
+    
+    # Wedge: converging trend lines (ascending or descending)
+    if len(recent) >= 20:
+        highs_range = recent['High'].iloc[-20:].max() - recent['High'].iloc[-10:].max()
+        lows_range = recent['Low'].iloc[-20:].min() - recent['Low'].iloc[-10:].min()
+        
+        # Ascending wedge: higher lows, converging highs
+        if lows_range > 0 and highs_range < lows_range * 0.3:
+            patterns.append("WEDGE_ASCENDING")
+        # Descending wedge: lower highs, converging lows
+        elif highs_range < 0 and abs(lows_range) < abs(highs_range) * 0.3:
+            patterns.append("WEDGE_DESCENDING")
+    
+    # Cup & Handle: U-shaped recovery with small pullback
+    if len(recent) >= 30:
+        low_point = recent['Low'].iloc[-30:].idxmin()
+        left_high = recent['High'].iloc[-30:low_point].max()
+        right_high = recent['High'].iloc[low_point:].max()
+        
+        if abs(left_high - right_high) / left_high < 0.02 and left_high > recent['Low'].iloc[-1]:
+            # Check for handle (small pullback)
+            handle_low = recent['Low'].iloc[-5:].min()
+            if handle_low > recent['Low'].iloc[low_point]:
+                patterns.append("CUP_HANDLE")
+    
+    # Flag: small consolidation after strong directional move
+    if len(recent) >= 25:
+        early = recent.iloc[-25:-15]
+        recent_part = recent.iloc[-15:]
+        
+        early_range = (early['High'].max() - early['Low'].min()) / early['Close'].mean()
+        recent_range = (recent_part['High'].max() - recent_part['Low'].min()) / recent_part['Close'].mean()
+        
+        # Consolidation is much tighter than prior move
+        if recent_range < early_range * 0.4:
+            patterns.append("FLAG")
     
     return patterns
 
