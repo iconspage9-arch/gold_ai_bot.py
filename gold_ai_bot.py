@@ -355,8 +355,8 @@ def get_win_rate():
     }
 
 # ================= FEATURE: BACKTESTING =================
-def backtest_strategy(symbol, timeframe="H1", days=30):
-    """Backtest strategy on historical data with improved logic"""
+def backtest_strategy_allow_overlap(symbol, timeframe="H1", days=30):
+    """Backtest strategy where every valid signal is taken, even if a previous trade is still open"""
     try:
         df = yf.download(symbol, period=f"{days}d", interval=timeframe, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -369,51 +369,39 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
         wins = 0
         losses = 0
         total_profit = 0
+        total_trades = 0
         
-        # Use realistic EMA + RSI signals for backtest
+        # Indicators
         ema_short = EMAIndicator(df["Close"], 9).ema_indicator()
         ema_long = EMAIndicator(df["Close"], 21).ema_indicator()
         rsi = RSIIndicator(df["Close"], 14).rsi()
         
-        position = None
-        entry_price = 0
-        
         for i in range(1, len(df)):
-            # Signals
             buy_signal = ema_short.iloc[i] > ema_long.iloc[i] and rsi.iloc[i] < 70
             sell_signal = ema_short.iloc[i] < ema_long.iloc[i] and rsi.iloc[i] > 30
             
-            # Close previous position
-            if position == "BUY":
-                # Take profit / stop loss 1.5%
-                if df["High"].iloc[i] >= entry_price * 1.015:
-                    wins += 1
-                    total_profit += entry_price * 0.015
-                    position = None
-                elif df["Low"].iloc[i] <= entry_price * 0.985:
-                    losses += 1
-                    total_profit -= entry_price * 0.015
-                    position = None
-            elif position == "SELL":
-                if df["Low"].iloc[i] <= entry_price * 0.985:
-                    wins += 1
-                    total_profit += entry_price * 0.015
-                    position = None
-                elif df["High"].iloc[i] >= entry_price * 1.015:
-                    losses += 1
-                    total_profit -= entry_price * 0.015
-                    position = None
+            entry_price = df["Close"].iloc[i]
+            tp_price = entry_price * 1.015
+            sl_price = entry_price * 0.985
             
-            # Open new position if none
-            if position is None:
-                if buy_signal:
-                    position = "BUY"
-                    entry_price = df["Close"].iloc[i]
-                elif sell_signal:
-                    position = "SELL"
-                    entry_price = df["Close"].iloc[i]
+            if buy_signal:
+                total_trades += 1
+                if df["High"].iloc[i] >= tp_price:
+                    wins += 1
+                    total_profit += entry_price * 0.015
+                elif df["Low"].iloc[i] <= sl_price:
+                    losses += 1
+                    total_profit -= entry_price * 0.015
+            
+            if sell_signal:
+                total_trades += 1
+                if df["Low"].iloc[i] <= sl_price:
+                    wins += 1
+                    total_profit += entry_price * 0.015
+                elif df["High"].iloc[i] >= tp_price:
+                    losses += 1
+                    total_profit -= entry_price * 0.015
         
-        total_trades = wins + losses
         return {
             "total_trades": total_trades,
             "wins": wins,
