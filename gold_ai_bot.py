@@ -93,34 +93,62 @@ def build_forex_symbol(base, quote):
 
 # ================= DATA FUNCTIONS =================
 def fetch(tf, symbol="GC=F"):
-    df = yf.download(symbol, period="30d", interval=tf, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df.dropna(inplace=True)
-    
-    # Calculate indicators
-    df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-    df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
-    df["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
-    
-    macd = MACD(df["Close"], window_fast=12, window_slow=26, window_sign=9)
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    
-    df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
-    
-    # Bollinger Bands
-    bb = BollingerBands(df["Close"], window=20, window_dev=2)
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_lower"] = bb.bollinger_lband()
-    df["bb_mid"] = bb.bollinger_mavg()
-    
-    # Stochastic
-    stoch = StochasticOscillator(df["High"], df["Low"], df["Close"], window=14)
-    df["stoch_k"] = stoch.stoch()
-    df["stoch_d"] = stoch.stoch_signal()
-    
-    return df
+    try:
+        df = yf.download(symbol, period="30d", interval=tf, progress=False)
+        if df is None or len(df) == 0:
+            return None
+        
+        # Handle MultiIndex columns
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        # Check if we have required columns
+        if 'Close' not in df.columns or 'High' not in df.columns or 'Low' not in df.columns:
+            return None
+        
+        # Remove NaN values first
+        df = df.dropna()
+        if len(df) < 200:  # Need at least 200 bars for EMA200
+            return None
+        
+        # Convert to numeric, handle any string values
+        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+        df['High'] = pd.to_numeric(df['High'], errors='coerce')
+        df['Low'] = pd.to_numeric(df['Low'], errors='coerce')
+        
+        # Calculate indicators only if we have valid data
+        try:
+            df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
+            df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+            df["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
+            
+            macd = MACD(df["Close"], window_fast=12, window_slow=26, window_sign=9)
+            df["macd"] = macd.macd()
+            df["macd_signal"] = macd.macd_signal()
+            
+            df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+            
+            # Bollinger Bands
+            bb = BollingerBands(df["Close"], window=20, window_dev=2)
+            df["bb_upper"] = bb.bollinger_hband()
+            df["bb_lower"] = bb.bollinger_lband()
+            df["bb_mid"] = bb.bollinger_mavg()
+            
+            # Stochastic
+            stoch = StochasticOscillator(df["High"], df["Low"], df["Close"], window=14)
+            df["stoch_k"] = stoch.stoch()
+            df["stoch_d"] = stoch.stoch_signal()
+            
+            # Remove NaN from indicators
+            df = df.dropna()
+            
+            return df if len(df) > 0 else None
+        except Exception as e:
+            print(f"Indicator calculation error: {e}")
+            return None
+    except Exception as e:
+        print(f"Fetch error for {symbol}: {e}")
+        return None
 
 # ================= FEATURE: DIVERGENCE DETECTION =================
 def detect_divergence(df):
@@ -415,6 +443,9 @@ def get_journal_entries(limit=5):
     return []
 
 def analyze(df, symbol=None):
+    if df is None or len(df) == 0:
+        return None
+    
     last = df.iloc[-1]
     signals = []
     
@@ -605,6 +636,9 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         df_h4 = fetch(TIMEFRAMES["H4"], symbol)
         df_h1 = fetch(TIMEFRAMES["H1"], symbol)
         df_m30 = fetch(TIMEFRAMES["M30"], symbol)
+        if not df_h4 or not df_h1 or not df_m30:
+            await update.message.reply_text("❌ Not enough data for this pair.")
+            return
         sig_h4 = analyze(df_h4, symbol)
         sig_h1 = analyze(df_h1, symbol)
         sig_m30 = analyze(df_m30, symbol)
@@ -613,7 +647,13 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         df = df_m30
     else:
         df = fetch(TIMEFRAMES[choice], symbol)
+        if not df or len(df) == 0:
+            await update.message.reply_text("❌ Not enough data for this pair. Try a different one.")
+            return
         sigs = analyze(df, symbol)
+        if not sigs:
+            await update.message.reply_text("❌ Error analyzing data. Try again.")
+            return
         note = ""
 
     emoji = {"BUY":"🟢 BUY", "SELL":"🔴 SELL"}
