@@ -5,6 +5,7 @@ import json, os
 import threading
 import time
 import requests
+from datetime import datetime
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import AverageTrueRange, BollingerBands
@@ -15,6 +16,8 @@ from flask import Flask
 # ================= CONFIG =================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 TIMEFRAMES = {"M30": "30m", "H1": "60m", "H4": "4h"}
+TRADE_HISTORY_FILE = "trade_history.json"
+JOURNAL_FILE = "trade_journal.json"
 
 # Available trading pairs organized by type
 PAIRS_BY_TYPE = {
@@ -120,6 +123,239 @@ def fetch(tf, symbol="GC=F"):
     
     return df
 
+# ================= FEATURE: DIVERGENCE DETECTION =================
+def detect_divergence(df):
+    """Detect RSI and MACD divergence (bullish/bearish)"""
+    if len(df) < 20:
+        return None
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # RSI Divergence: Price lower but RSI higher (bullish) or price higher but RSI lower (bearish)
+    rsi_div = None
+    if len(df) >= 50:
+        low_20 = df['Low'].iloc[-20:].min()
+        low_50 = df['Low'].iloc[-50:].min()
+        rsi_low_20 = df['rsi'].iloc[-20:].min()
+        rsi_low_50 = df['rsi'].iloc[-50:].min()
+        
+        if low_20 < low_50 and rsi_low_20 > rsi_low_50:
+            rsi_div = "BULLISH"  # Lower low but higher RSI = potential reversal up
+        elif len(df) >= 20:
+            high_20 = df['High'].iloc[-20:].max()
+            high_50 = df['High'].iloc[-50:].max()
+            rsi_high_20 = df['rsi'].iloc[-20:].max()
+            rsi_high_50 = df['rsi'].iloc[-50:].max()
+            
+            if high_20 > high_50 and rsi_high_20 < rsi_high_50:
+                rsi_div = "BEARISH"  # Higher high but lower RSI = potential reversal down
+    
+    # MACD Divergence
+    macd_div = None
+    if len(df) >= 30:
+        macd_momentum = df['macd'].iloc[-1] - df['macd'].iloc[-30]
+        if df['Close'].iloc[-1] < df['Close'].iloc[-30] and macd_momentum > 0:
+            macd_div = "BULLISH"
+        elif df['Close'].iloc[-1] > df['Close'].iloc[-30] and macd_momentum < 0:
+            macd_div = "BEARISH"
+    
+    return {"rsi": rsi_div, "macd": macd_div}
+
+# ================= FEATURE: FIBONACCI LEVELS =================
+def calculate_fibonacci(high, low, direction="UP"):
+    """Calculate Fibonacci retracement levels"""
+    diff = high - low
+    if direction == "UP":
+        levels = {
+            "0%": low,
+            "23.6%": low + (diff * 0.236),
+            "38.2%": low + (diff * 0.382),
+            "50%": low + (diff * 0.5),
+            "61.8%": low + (diff * 0.618),
+            "78.6%": low + (diff * 0.786),
+            "100%": high
+        }
+    else:
+        levels = {
+            "0%": high,
+            "23.6%": high - (diff * 0.236),
+            "38.2%": high - (diff * 0.382),
+            "50%": high - (diff * 0.5),
+            "61.8%": high - (diff * 0.618),
+            "78.6%": high - (diff * 0.786),
+            "100%": low
+        }
+    return levels
+
+# ================= FEATURE: PATTERN RECOGNITION =================
+def detect_patterns(df):
+    """Detect chart patterns: double top/bottom, triangle, flag"""
+    if len(df) < 50:
+        return []
+    
+    patterns = []
+    recent = df.iloc[-50:]
+    
+    # Double Top: 2 peaks at similar levels
+    peaks = []
+    for i in range(2, len(recent) - 2):
+        if recent['High'].iloc[i] > recent['High'].iloc[i-2] and recent['High'].iloc[i] > recent['High'].iloc[i+2]:
+            peaks.append((i, recent['High'].iloc[i]))
+    
+    if len(peaks) >= 2:
+        p1, p2 = peaks[-2], peaks[-1]
+        if abs(p1[1] - p2[1]) / p1[1] < 0.02:  # Within 2%
+            patterns.append("DOUBLE_TOP")
+    
+    # Double Bottom
+    troughs = []
+    for i in range(2, len(recent) - 2):
+        if recent['Low'].iloc[i] < recent['Low'].iloc[i-2] and recent['Low'].iloc[i] < recent['Low'].iloc[i+2]:
+            troughs.append((i, recent['Low'].iloc[i]))
+    
+    if len(troughs) >= 2:
+        t1, t2 = troughs[-2], troughs[-1]
+        if abs(t1[1] - t2[1]) / t1[1] < 0.02:  # Within 2%
+            patterns.append("DOUBLE_BOTTOM")
+    
+    # Triangle: contracting high/low range
+    if len(recent) >= 20:
+        high_range = recent['High'].iloc[-20:].max() - recent['High'].iloc[-20:].min()
+        low_range = recent['Low'].iloc[-20:].max() - recent['Low'].iloc[-20:].min()
+        curr_high = recent['High'].iloc[-10:].max() - recent['High'].iloc[-10:].min()
+        curr_low = recent['Low'].iloc[-10:].max() - recent['Low'].iloc[-10:].min()
+        
+        if curr_high < high_range * 0.5 and curr_low < low_range * 0.5:
+            patterns.append("TRIANGLE")
+    
+    return patterns
+
+# ================= FEATURE: TRADE HISTORY & WIN RATE =================
+def load_trades():
+    """Load trade history from file"""
+    if os.path.exists(TRADE_HISTORY_FILE):
+        with open(TRADE_HISTORY_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_trade(pair, signal, tp, sl, entry):
+    """Log a new trade signal"""
+    trades = load_trades()
+    trade = {
+        "timestamp": datetime.now().isoformat(),
+        "pair": pair,
+        "signal": signal,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "status": "OPEN"
+    }
+    trades.append(trade)
+    with open(TRADE_HISTORY_FILE, 'w') as f:
+        json.dump(trades, f, indent=2)
+
+def get_win_rate():
+    """Calculate bot's win rate from closed trades"""
+    trades = load_trades()
+    closed = [t for t in trades if t["status"] != "OPEN"]
+    if not closed:
+        return None
+    
+    wins = sum(1 for t in closed if t["status"] == "WIN")
+    return {
+        "total_trades": len(closed),
+        "wins": wins,
+        "losses": len(closed) - wins,
+        "win_rate": (wins / len(closed) * 100) if closed else 0
+    }
+
+# ================= FEATURE: BACKTESTING =================
+def backtest_strategy(symbol, timeframe="H1", days=30):
+    """Backtest strategy on historical data"""
+    try:
+        df = yf.download(symbol, period=f"{days}d", interval=timeframe, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.dropna(inplace=True)
+        
+        if len(df) < 50:
+            return None
+        
+        wins = 0
+        losses = 0
+        total_profit = 0
+        
+        # Simulate signals on historical data
+        for i in range(50, len(df)):
+            window = df.iloc[i-50:i]
+            last = window.iloc[-1]
+            
+            # Quick signal check
+            ema50 = EMAIndicator(window["Close"], 50).ema_indicator().iloc[-1]
+            ema200 = EMAIndicator(window["Close"], 200).ema_indicator().iloc[-1]
+            rsi = RSIIndicator(window["Close"], 14).rsi().iloc[-1]
+            
+            signal = "BUY" if ema50 > ema200 and rsi < 70 else "SELL" if ema50 < ema200 and rsi > 30 else None
+            
+            if signal and i + 1 < len(df):
+                entry = last['Close']
+                future = df.iloc[i+1]
+                
+                if signal == "BUY":
+                    if future['High'] > entry * 1.02:  # TP hit (2%)
+                        wins += 1
+                        total_profit += entry * 0.02
+                    elif future['Low'] < entry * 0.99:  # SL hit (1%)
+                        losses += 1
+                        total_profit -= entry * 0.01
+                else:
+                    if future['Low'] < entry * 0.98:  # TP hit (2%)
+                        wins += 1
+                        total_profit += entry * 0.02
+                    elif future['High'] > entry * 1.01:  # SL hit (1%)
+                        losses += 1
+                        total_profit -= entry * 0.01
+        
+        return {
+            "total_trades": wins + losses,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0,
+            "total_profit": total_profit
+        }
+    except Exception as e:
+        return None
+
+# ================= FEATURE: TRADE JOURNAL =================
+def log_journal(pair, signal, tp, sl, entry, note):
+    """Log trade to personal journal with notes"""
+    journal = []
+    if os.path.exists(JOURNAL_FILE):
+        with open(JOURNAL_FILE, 'r') as f:
+            journal = json.load(f)
+    
+    entry_log = {
+        "timestamp": datetime.now().isoformat(),
+        "pair": pair,
+        "signal": signal,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "user_note": note
+    }
+    journal.append(entry_log)
+    with open(JOURNAL_FILE, 'w') as f:
+        json.dump(journal, f, indent=2)
+
+def get_journal_entries(limit=5):
+    """Get recent journal entries"""
+    if os.path.exists(JOURNAL_FILE):
+        with open(JOURNAL_FILE, 'r') as f:
+            journal = json.load(f)
+        return journal[-limit:] if journal else []
+    return []
+
 def analyze(df, symbol=None):
     last = df.iloc[-1]
     signals = []
@@ -169,6 +405,17 @@ def analyze(df, symbol=None):
     else:
         final_signal = "SELL"
         agreement = (sell_count / total) * 100 if total > 0 else 0
+    
+    # Detect divergence (bonus confirmation)
+    divergence = detect_divergence(df)
+    
+    # Detect patterns
+    patterns = detect_patterns(df)
+    
+    # Calculate Fibonacci levels
+    high_50 = df['High'].iloc[-50:].max()
+    low_50 = df['Low'].iloc[-50:].min()
+    fib_levels = calculate_fibonacci(high_50, low_50, "UP" if final_signal == "BUY" else "DOWN")
     
     # Calculate TP and SL
     atr = last.atr if pd.notna(last.atr) else 0
@@ -287,7 +534,10 @@ def analyze(df, symbol=None):
         "bb": bb_signal,
         "stoch": round(last.stoch_k, 2) if pd.notna(last.stoch_k) else 0,
         "tp": round(tp, 2),
-        "sl": round(sl, 2)
+        "sl": round(sl, 2),
+        "divergence": divergence,
+        "patterns": patterns,
+        "fib_levels": {k: round(v, 5) for k, v in fib_levels.items()}
     }
 
 # ================= TELEGRAM =================
@@ -325,6 +575,23 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
     entry_s = f"${price:.{dec}f}"
     tp_s = f"${sigs['tp']:.{dec}f}"
     sl_s = f"${sigs['sl']:.{dec}f}"
+    
+    # Build message with all features
+    div_text = ""
+    if sigs['divergence']['rsi'] or sigs['divergence']['macd']:
+        div_text = f"🔷 DIVERGENCE: RSI {sigs['divergence']['rsi'] or 'None'} | MACD {sigs['divergence']['macd'] or 'None'}\n"
+    
+    pattern_text = ""
+    if sigs['patterns']:
+        pattern_text = f"🔶 PATTERNS: {', '.join(sigs['patterns'])}\n"
+    
+    fib_text = ""
+    if sigs['fib_levels']:
+        fib_important = ["38.2%", "50%", "61.8%"]
+        fib_text = "📊 FIBONACCI LEVELS:\n"
+        for level in fib_important:
+            if level in sigs['fib_levels']:
+                fib_text += f"  {level}: ${sigs['fib_levels'][level]:.{dec}f}\n"
 
     await update.message.reply_text(
         f"🟡 {pair_name} SIGNAL\n\n"
@@ -335,22 +602,65 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         f"MACD: {sigs['macd']}\n"
         f"Bollinger Bands: {sigs['bb']}\n"
         f"Stochastic: {sigs['stoch']}\n\n"
+        f"{div_text}"
+        f"{pattern_text}"
+        f"{fib_text}"
         f"🎯 TARGETS:\n"
         f"Entry: {entry_s}\n"
         f"Take Profit: {tp_s}\n"
         f"Stop Loss: {sl_s}\n\n"
         f"{note}"
     )
+    
+    # Auto-log trade to history
+    save_trade(pair_name, signal, sigs['tp'], sigs['sl'], price)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_data = context.user_data
     
+    # Commands
+    if text.lower() == "/history":
+        wr = get_win_rate()
+        if wr:
+            msg = f"📈 WIN RATE:\n✅ Wins: {wr['wins']}\n❌ Losses: {wr['losses']}\nTotal: {wr['total_trades']}\n📊 Rate: {wr['win_rate']:.1f}%"
+        else:
+            msg = "No closed trades yet."
+        await update.message.reply_text(msg)
+        return
+    
+    if text.lower() == "/backtest":
+        result = backtest_strategy("BTC-USD", "1h", 30)
+        if result:
+            msg = f"🔬 BACKTEST (30d BTC):\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Rate: {result['win_rate']:.1f}%\n💵 Profit: ${result['total_profit']:.2f}"
+        else:
+            msg = "Backtest failed."
+        await update.message.reply_text(msg)
+        return
+    
+    if text.lower().startswith("/journal"):
+        entries = get_journal_entries(5)
+        if entries:
+            msg = "📔 TRADE JOURNAL (Last 5):\n"
+            for e in entries[-5:]:
+                msg += f"\n{e['pair']} {e['signal']} @ ${e['entry']:.5f}\nNote: {e['user_note']}\n"
+        else:
+            msg = "No journal entries yet."
+        await update.message.reply_text(msg)
+        return
+    
+    if text.lower().startswith("/note "):
+        note = text[6:]
+        if user_data.get("pair"):
+            log_journal(user_data.get("pair_name", "Unknown"), "USER_NOTE", 0, 0, 0, note)
+            await update.message.reply_text("✅ Note logged!")
+        return
+    
     # Step 1: Start - ask for type
     if text.lower() == "start":
         kb = [["COMMODITIES", "FOREX", "CRYPTO", "INDICES"]]
         await update.message.reply_text(
-            "Choose pair type:",
+            "Choose pair type:\n\n/history - Win rate\n/backtest - Test strategy\n/journal - Trade notes\n/note [text] - Log note",
             reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
         )
         user_data.clear()
