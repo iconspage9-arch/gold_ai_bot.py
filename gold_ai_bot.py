@@ -666,7 +666,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Step 1: START - Show main menu
     if text.lower() == "/start" or text.lower() == "start":
-        kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+        kb = [["Trade History"], ["Backtest"], ["View Notes"], ["Make Note"], ["Get Signal"]]
         await update.message.reply_text(
             "🤖 Trading Bot Menu:\n\nChoose an option:",
             reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True)
@@ -687,23 +687,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 msg = f"❌ Error: {str(e)}"
             await update.message.reply_text(msg)
-            kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+            kb = [["Trade History"], ["Backtest"], ["View Notes"], ["Make Note"], ["Get Signal"]]
+            await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            return
+        
+        if text == "View Notes":
+            try:
+                entries = get_journal_entries(10)
+                if entries:
+                    msg = "📔 TRADE JOURNAL (Last 10):\n"
+                    for e in entries:
+                        msg += f"\n• {e.get('pair', 'Unknown')}: {e.get('user_note', 'No note')}"
+                else:
+                    msg = "❌ No journal entries yet."
+            except Exception as e:
+                msg = f"❌ Error: {str(e)}"
+            await update.message.reply_text(msg)
+            kb = [["Trade History"], ["Backtest"], ["View Notes"], ["Make Note"], ["Get Signal"]]
             await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
             return
         
         if text == "Backtest":
-            try:
-                await update.message.reply_text("⏳ Running backtest on 7 days BTC data...")
-                result = backtest_strategy("BTC-USD", "1h", 7)
-                if result and result['total_trades'] > 0:
-                    msg = f"✅ BACKTEST COMPLETE (7d BTC-USD H1):\n\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Win Rate: {result['win_rate']:.1f}%\n💵 P&L: ${result['total_profit']:.4f}"
-                else:
-                    msg = "❌ Backtest: No trades found"
-            except Exception as e:
-                msg = f"❌ Backtest error: {str(e)}"
-            await update.message.reply_text(msg)
-            kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
-            await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            kb = [["BTC-USD"], ["Gold"], ["EUR/USD"]]
+            await update.message.reply_text("Choose pair to backtest:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            user_data["stage"] = "backtest_pair"
             return
         
         if text == "Make Note":
@@ -717,7 +724,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_data["stage"] = "choosing_type"
             return
     
-    # Step 3: WAITING FOR NOTE
+    # Step 3: BACKTEST - Select pair
+    if user_data.get("stage") == "backtest_pair":
+        pair_map = {"BTC-USD": "BTC-USD", "Gold": "GC=F", "EUR/USD": "EURUSD=X"}
+        if text in pair_map:
+            user_data["backtest_pair"] = pair_map[text]
+            kb = [["7"], ["14"], ["30"]]
+            await update.message.reply_text("How many days back? (7/14/30):", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            user_data["stage"] = "backtest_days"
+            return
+    
+    # Step 3b: BACKTEST - Select days
+    if user_data.get("stage") == "backtest_days":
+        if text in ["7", "14", "30"]:
+            days = int(text)
+            pair = user_data.get("backtest_pair", "BTC-USD")
+            try:
+                await update.message.reply_text(f"⏳ Running backtest on {days}d {pair}...")
+                result = backtest_strategy(pair, "1h", days)
+                if result and result['total_trades'] > 0:
+                    msg = f"✅ BACKTEST COMPLETE ({days}d {pair} H1):\n\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Win Rate: {result['win_rate']:.1f}%\n💵 P&L: ${result['total_profit']:.4f}"
+                else:
+                    msg = f"❌ Backtest: No trades found for {pair}"
+            except Exception as e:
+                msg = f"❌ Backtest error: {str(e)}"
+            await update.message.reply_text(msg)
+            kb = [["Trade History"], ["Backtest"], ["View Notes"], ["Make Note"], ["Get Signal"]]
+            await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            user_data["stage"] = "main_menu"
+            return
+    
+    # Step 4: WAITING FOR NOTE
     if user_data.get("stage") == "waiting_for_note":
         note = text
         try:
@@ -725,12 +762,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Note saved!")
         except Exception as e:
             await update.message.reply_text(f"❌ Error saving note: {str(e)}")
-        kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+        kb = [["Trade History"], ["Backtest"], ["View Notes"], ["Make Note"], ["Get Signal"]]
         await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
         user_data["stage"] = "main_menu"
         return
     
-    # Step 4: CHOOSING TYPE - for Get Signal
+    # Step 5: CHOOSING TYPE - for Get Signal
     if user_data.get("stage") == "choosing_type":
         if text.upper() in PAIRS_BY_TYPE:
             user_data["type"] = text.upper()
@@ -740,43 +777,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_data["stage"] = "choosing_pair"
             return
     
-    # Step 5: CHOOSING PAIR
+    # Step 6: CHOOSING PAIR
     if user_data.get("stage") == "choosing_pair":
         pair_type = user_data.get("type", "COMMODITIES")
         if text in PAIRS_BY_TYPE.get(pair_type, []):
-            user_data["pair"] = text
+            user_data["pair_name"] = text
+            user_data["pair"] = PAIRS_BY_TYPE[pair_type][text]  # Get symbol from dict
             
-            # For FOREX, ask for timeframe
-            if pair_type == "FOREX":
-                kb = [["M30", "H1"], ["H4", "D1"]]
-                await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
-                user_data["stage"] = "choosing_timeframe"
-            else:
-                # For others, ask timeframe directly
-                kb = [["M30", "H1"], ["H4", "D1"]]
-                await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
-                user_data["stage"] = "choosing_timeframe"
+            kb = [["M30", "H1"], ["H4", "D1"]]
+            await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
+            user_data["stage"] = "choosing_timeframe"
             return
     
-    # Step 6: CHOOSING TIMEFRAME
+    # Step 7: CHOOSING TIMEFRAME - Analyze and send signal
     if user_data.get("stage") == "choosing_timeframe":
         if text in ["M30", "H1", "H4", "D1"]:
             user_data["timeframe"] = text
             pair_type = user_data.get("type", "COMMODITIES")
-            pair = user_data.get("pair", "GC=F")
+            pair_name = user_data.get("pair_name", "Unknown")
+            pair_symbol = user_data.get("pair", "GC=F")
             
             try:
                 await update.message.reply_text("⏳ Analyzing... This may take 5-10 seconds...")
-                df = fetch(text, pair)
+                df = fetch(text, pair_symbol)
                 if df is not None and len(df) > 0:
-                    result = analyze(df, pair)
-                    await send_signal(update, pair_type, pair, pair)
+                    result = analyze(df, pair_symbol)
+                    await send_signal(update, pair_type, pair_symbol, pair_name)
                 else:
-                    await update.message.reply_text(f"❌ No data for {pair}")
+                    await update.message.reply_text(f"❌ No data for {pair_name}")
             except Exception as e:
                 await update.message.reply_text(f"❌ Error: {str(e)}")
             
-            kb = [["Trade History"], ["Backtest"], ["Make Note"], ["Get Signal"]]
+            kb = [["Trade History"], ["Backtest"], ["View Notes"], ["Make Note"], ["Get Signal"]]
             await update.message.reply_text("Choose another option:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
             user_data["stage"] = "main_menu"
             return
