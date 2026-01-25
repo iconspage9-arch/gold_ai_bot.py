@@ -84,6 +84,11 @@ def pips_to_decimal(pair_name, pips):
     else:
         return pips * 0.0001  # Standard pairs = 4 decimals
 
+# Helper function to build forex pair symbol
+def build_forex_symbol(base, quote):
+    """Convert base/quote to yfinance symbol (e.g., USD+GBP -> USDGBP=X)"""
+    return f"{base}{quote}=X"
+
 # ================= DATA FUNCTIONS =================
 def fetch(tf, symbol="GC=F"):
     df = yf.download(symbol, period="30d", interval=tf, progress=False)
