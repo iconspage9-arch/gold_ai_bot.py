@@ -356,7 +356,7 @@ def get_win_rate():
 
 # ================= FEATURE: BACKTESTING =================
 def backtest_strategy(symbol, timeframe="H1", days=30):
-    """Backtest strategy on historical data"""
+    """Backtest strategy on historical data with improved logic"""
     try:
         df = yf.download(symbol, period=f"{days}d", interval=timeframe, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -370,47 +370,48 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
         losses = 0
         total_profit = 0
         
-        # Simulate signals on historical data
-        for i in range(20, len(df)):
-            window = df.iloc[max(0, i-50):i+1]
-            last = window.iloc[-1]
+        # Use realistic EMA + RSI signals for backtest
+        ema_short = EMAIndicator(df["Close"], 9).ema_indicator()
+        ema_long = EMAIndicator(df["Close"], 21).ema_indicator()
+        rsi = RSIIndicator(df["Close"], 14).rsi()
+        
+        position = None
+        entry_price = 0
+        
+        for i in range(1, len(df)):
+            # Signals
+            buy_signal = ema_short.iloc[i] > ema_long.iloc[i] and rsi.iloc[i] < 70
+            sell_signal = ema_short.iloc[i] < ema_long.iloc[i] and rsi.iloc[i] > 30
             
-            # Simple signal check - use shorter periods for small datasets
-            rsi = RSIIndicator(window["Close"], 14).rsi().iloc[-1]
-            ema9 = EMAIndicator(window["Close"], 9).ema_indicator().iloc[-1]
-            ema21 = EMAIndicator(window["Close"], 21).ema_indicator().iloc[-1]
+            # Close previous position
+            if position == "BUY":
+                # Take profit / stop loss 1.5%
+                if df["High"].iloc[i] >= entry_price * 1.015:
+                    wins += 1
+                    total_profit += entry_price * 0.015
+                    position = None
+                elif df["Low"].iloc[i] <= entry_price * 0.985:
+                    losses += 1
+                    total_profit -= entry_price * 0.015
+                    position = None
+            elif position == "SELL":
+                if df["Low"].iloc[i] <= entry_price * 0.985:
+                    wins += 1
+                    total_profit += entry_price * 0.015
+                    position = None
+                elif df["High"].iloc[i] >= entry_price * 1.015:
+                    losses += 1
+                    total_profit -= entry_price * 0.015
+                    position = None
             
-            # Relaxed signal: just check EMA9 > EMA21 + RSI not extreme
-            signal = None
-            if ema9 > ema21 and rsi < 80:
-                signal = "BUY"
-            elif ema9 < ema21 and rsi > 20:
-                signal = "SELL"
-            
-            if signal and i + 1 < len(df):
-                entry = last['Close']
-                # Check next 3 candles for TP/SL hit (more likely with small lookback)
-                for j in range(1, min(4, len(df) - i)):
-                    future = df.iloc[i+j]
-                    
-                    if signal == "BUY":
-                        if future['High'] >= entry * 1.015:  # TP hit (1.5%)
-                            wins += 1
-                            total_profit += entry * 0.015
-                            break
-                        elif future['Low'] <= entry * 0.985:  # SL hit (1.5%)
-                            losses += 1
-                            total_profit -= entry * 0.015
-                            break
-                    else:  # SELL
-                        if future['Low'] <= entry * 0.985:  # TP hit (1.5%)
-                            wins += 1
-                            total_profit += entry * 0.015
-                            break
-                        elif future['High'] >= entry * 1.015:  # SL hit (1.5%)
-                            losses += 1
-                            total_profit -= entry * 0.015
-                            break
+            # Open new position if none
+            if position is None:
+                if buy_signal:
+                    position = "BUY"
+                    entry_price = df["Close"].iloc[i]
+                elif sell_signal:
+                    position = "SELL"
+                    entry_price = df["Close"].iloc[i]
         
         total_trades = wins + losses
         return {
@@ -423,6 +424,7 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
     except Exception as e:
         print(f"Backtest error: {e}")
         return None
+
 
 # ================= FEATURE: TRADE JOURNAL =================
 def log_journal(pair, signal, tp, sl, entry, note):
