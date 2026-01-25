@@ -67,11 +67,9 @@ file_lock = threading.Lock()
 def _parse_iso_date(s):
     """Parse an ISO timestamp emitted by this app (best-effort)."""
     try:
-        # datetime.fromisoformat handles strings produced by datetime.now().isoformat()
         return datetime.fromisoformat(s)
     except Exception:
         try:
-            # fallback: try removing trailing Z
             if s.endswith("Z"):
                 return datetime.fromisoformat(s[:-1])
         except Exception:
@@ -90,7 +88,6 @@ def has_trade_on_date(check_date=None):
         dt = _parse_iso_date(ts)
         if dt is None:
             continue
-        # Compare dates in UTC (we saved naive local datetimes previously; treat them as local)
         if dt.date() == check_date:
             return True
     return False
@@ -320,9 +317,7 @@ def detect_patterns(df):
         recent_high_range = recent['High'].iloc[-10:].max() - recent['High'].iloc[-10:].min()
         recent_low_range = recent['Low'].iloc[-10:].max() - recent['Low'].iloc[-10:].min()
         
-        # Ascending wedge: higher lows, converging highs
         if recent_low_range < total_low_range * 0.5 and recent_high_range < total_high_range * 0.5:
-            # Use simple heuristic; more robust implementation would fit lines
             patterns.append("WEDGE")
     
     # Cup & Handle: U-shaped recovery with small pullback
@@ -348,7 +343,6 @@ def detect_patterns(df):
             early_range = (early['High'].max() - early['Low'].min()) / early['Close'].mean()
             recent_range = (recent_part['High'].max() - recent_part['Low'].min()) / recent_part['Close'].mean()
             
-            # Consolidation is much tighter than prior move
             if recent_range < early_range * 0.4:
                 patterns.append("FLAG")
     
@@ -370,7 +364,6 @@ def save_trade(pair, signal, tp, sl, entry):
 
     Returns True if saved, False if a trade for today already exists.
     """
-    # Use UTC date for "one trade per day" enforcement
     today_utc = datetime.now(timezone.utc).date()
     if has_trade_on_date(today_utc):
         return False
@@ -410,17 +403,16 @@ def get_win_rate():
 
 # ================= FEATURE: BACKTESTING =================
 def backtest_strategy(symbol, timeframe="H1", days=30):
-    """Backtest strategy where every valid signal is taken, even if a previous trade is still open.
+    """Backtest using the same signals and majority decision logic as analyze().
 
-    This version:
-    - fixes TP/SL logic for SELL trades,
-    - skips iterations with NaN indicators,
-    - uses explicit buy/sell TP/SL variables for clarity,
-    - enforces at most one trade per calendar day in the backtest (based on candle date).
-
-    This keeps your original approach (checking TP/SL hits inside the same candle).
-    If you want multi-candle trade tracking (hold until TP/SL hit in subsequent candles),
-    I can extend the function to simulate trade durations.
+    Behavior:
+    - Downloads historical candles with yfinance.
+    - Computes the same indicators used by analyze().
+    - For each candle (starting after enough history to compute ema50), runs analyze()
+      on historical data up to that candle (no look-ahead).
+    - Takes at most one trade per calendar day (first valid signal that day).
+    - Resolves trades within the same candle using the TP/SL computed by analyze().
+    - Returns aggregated metrics.
     """
     try:
         df = yf.download(symbol, period=f"{days}d", interval=timeframe, progress=False)
@@ -428,82 +420,97 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
             df.columns = df.columns.get_level_values(0)
         df.dropna(inplace=True)
         
-        if len(df) < 20:
+        if len(df) < 60:  # ensure enough history for indicators and fib/analysis
             return None
         
+        # Compute indicators for entire df so analyze() can use them on sub-slices without recomputing heavy ops
+        # (We keep results in df so sub-slices inherit them)
+        try:
+            df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
+            if len(df) >= 200:
+                df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+            else:
+                df["ema200"] = np.nan
+
+            df["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
+            macd = MACD(df["Close"], window_fast=12, window_slow=26, window_sign=9)
+            df["macd"] = macd.macd()
+            df["macd_signal"] = macd.macd_signal()
+            df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+            bb = BollingerBands(df["Close"], window=20, window_dev=2)
+            df["bb_upper"] = bb.bollinger_hband()
+            df["bb_lower"] = bb.bollinger_lband()
+            df["bb_mid"] = bb.bollinger_mavg()
+            stoch = StochasticOscillator(df["High"], df["Low"], df["Close"], window=14)
+            df["stoch_k"] = stoch.stoch()
+            df["stoch_d"] = stoch.stoch_signal()
+        except Exception as e:
+            print(f"Backtest indicator calc error: {e}")
+            return None
+
         wins = 0
         losses = 0
         total_profit = 0.0
         total_trades = 0
-        
-        # Indicators
-        ema_short = EMAIndicator(df["Close"], 9).ema_indicator()
-        ema_long = EMAIndicator(df["Close"], 21).ema_indicator()
-        rsi = RSIIndicator(df["Close"], 14).rsi()
-        
-        last_trade_date = None  # track last date we took a trade (calendar date)
-        
-        for i in range(1, len(df)):
-            # skip if any required indicator is NaN for this index
-            if pd.isna(ema_short.iloc[i]) or pd.isna(ema_long.iloc[i]) or pd.isna(rsi.iloc[i]):
+
+        last_trade_date = None  # calendar date of last taken trade in backtest
+
+        # Start from index where ema50 is available (index 49) to avoid early false signals
+        start_idx = 50 if len(df) > 50 else 1
+
+        for i in range(start_idx, len(df)):
+            # Skip if indicators are NaN at this candle
+            if pd.isna(df["ema50"].iloc[i]) or pd.isna(df["rsi"].iloc[i]) or pd.isna(df["macd"].iloc[i]) or pd.isna(df["macd_signal"].iloc[i]):
                 continue
 
-            # Get candle date (use timestamp of index)
-            try:
-                candle_ts = pd.Timestamp(df.index[i])
-                candle_date = candle_ts.date()
-            except Exception:
-                # fallback to today's date (shouldn't happen in proper backtest)
-                candle_date = datetime.now().date()
+            candle_ts = pd.Timestamp(df.index[i])
+            candle_date = candle_ts.date()
 
-            # enforce one trade per day: skip if we already traded on this date
+            # enforce one trade per calendar day
             if last_trade_date is not None and candle_date == last_trade_date:
                 continue
 
-            buy_signal = (ema_short.iloc[i] > ema_long.iloc[i]) and (rsi.iloc[i] < 70)
-            sell_signal = (ema_short.iloc[i] < ema_long.iloc[i]) and (rsi.iloc[i] > 30)
-            
-            entry_price = df["Close"].iloc[i]
-            # Define TP/SL explicitly for buy and sell directions
-            buy_tp = entry_price * 1.015
-            buy_sl = entry_price * 0.985
-            sell_tp = entry_price * 0.985
-            sell_sl = entry_price * 1.015
-            
-            trade_taken = False
+            # Build historical sub-DataFrame up to and including this candle (no look-ahead)
+            hist = df.iloc[: i + 1].copy()
+            # Ensure hist has enough rows for analyze's internal operations; analyze() already checks len
+            sig = analyze(hist, symbol)
+            if not sig:
+                continue
 
-            # Evaluate buy signal outcome within the same candle
-            if buy_signal:
-                total_trades += 1
-                trade_taken = True
-                # If high reaches buy TP -> win
-                if df["High"].iloc[i] >= buy_tp:
+            final_signal = sig.get("signal")
+            tp = sig.get("tp")
+            sl = sig.get("sl")
+            entry_price = hist["Close"].iloc[-1]
+
+            # Skip if TP/SL missing
+            if tp is None or sl is None:
+                # Still count as a taken trade? We'll skip counting unresolved configuration to keep metrics meaningful
+                continue
+
+            # Register the trade attempt
+            total_trades += 1
+            trade_taken = True
+
+            # Resolve trade within the same candle using that candle's High/Low
+            if final_signal == "BUY":
+                if df["High"].iloc[i] >= tp:
                     wins += 1
                     total_profit += entry_price * 0.015
-                # Else if low reaches buy SL -> loss
-                elif df["Low"].iloc[i] <= buy_sl:
+                elif df["Low"].iloc[i] <= sl:
                     losses += 1
                     total_profit -= entry_price * 0.015
-                # else: no resolution within candle => treated as unresolved (no P/L)
-            
-            # Evaluate sell signal outcome within the same candle
-            # Note: if both buy and sell signals somehow true, we'll count both as separate trades.
-            if (not trade_taken) and sell_signal:
-                total_trades += 1
-                trade_taken = True
-                # For sell, TP is below entry: low reaching sell_tp -> win
-                if df["Low"].iloc[i] <= sell_tp:
+                # else unresolved within candle -> counts as taken but neither win nor loss
+            else:  # SELL
+                if df["Low"].iloc[i] <= tp:
                     wins += 1
                     total_profit += entry_price * 0.015
-                # Else if high reaches sell SL -> loss
-                elif df["High"].iloc[i] >= sell_sl:
+                elif df["High"].iloc[i] >= sl:
                     losses += 1
                     total_profit -= entry_price * 0.015
-                # else: unresolved within candle
 
             if trade_taken:
-                last_trade_date = candle_date  # record that we took a trade this date
-        
+                last_trade_date = candle_date
+
         return {
             "total_trades": total_trades,
             "wins": wins,
