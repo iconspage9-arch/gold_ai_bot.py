@@ -252,14 +252,14 @@ def detect_patterns(df):
     
     # Cup & Handle: U-shaped recovery with small pullback
     if len(recent) >= 30:
-        low_point = recent['Low'].iloc[-30:].idxmin()
-        left_high = recent['High'].iloc[-30:low_point].max()
-        right_high = recent['High'].iloc[low_point:].max()
+        low_idx = recent['Low'].iloc[-30:].argmin()  # Get position, not label
+        left_high = recent['High'].iloc[-30:low_idx].max()
+        right_high = recent['High'].iloc[low_idx:].max()
         
         if abs(left_high - right_high) / left_high < 0.02 and left_high > recent['Low'].iloc[-1]:
             # Check for handle (small pullback)
             handle_low = recent['Low'].iloc[-5:].min()
-            if handle_low > recent['Low'].iloc[low_point]:
+            if handle_low > recent['Low'].iloc[low_idx]:
                 patterns.append("CUP_HANDLE")
     
     # Flag: small consolidation after strong directional move
