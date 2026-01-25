@@ -5,7 +5,7 @@ import json, os
 import threading
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import AverageTrueRange, BollingerBands
@@ -63,6 +63,37 @@ PAIRS_BY_TYPE = {
 
 # ================= UTILITIES =================
 file_lock = threading.Lock()
+
+def _parse_iso_date(s):
+    """Parse an ISO timestamp emitted by this app (best-effort)."""
+    try:
+        # datetime.fromisoformat handles strings produced by datetime.now().isoformat()
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            # fallback: try removing trailing Z
+            if s.endswith("Z"):
+                return datetime.fromisoformat(s[:-1])
+        except Exception:
+            return None
+    return None
+
+def has_trade_on_date(check_date=None):
+    """Return True if there's already a recorded trade on the given date (UTC)."""
+    if check_date is None:
+        check_date = datetime.now(timezone.utc).date()
+    trades = load_trades()
+    for t in trades:
+        ts = t.get("timestamp")
+        if not ts:
+            continue
+        dt = _parse_iso_date(ts)
+        if dt is None:
+            continue
+        # Compare dates in UTC (we saved naive local datetimes previously; treat them as local)
+        if dt.date() == check_date:
+            return True
+    return False
 
 # Helper function to detect swing highs and lows
 def find_swing_levels(df, lookback=20):
@@ -335,11 +366,19 @@ def load_trades():
     return []
 
 def save_trade(pair, signal, tp, sl, entry):
-    """Log a new trade signal"""
+    """Log a new trade signal. Respects one trade per UTC day rule.
+
+    Returns True if saved, False if a trade for today already exists.
+    """
+    # Use UTC date for "one trade per day" enforcement
+    today_utc = datetime.now(timezone.utc).date()
+    if has_trade_on_date(today_utc):
+        return False
+
     with file_lock:
         trades = load_trades()
         trade = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "pair": pair,
             "signal": signal,
             "entry": entry,
@@ -352,6 +391,7 @@ def save_trade(pair, signal, tp, sl, entry):
         with open(tmp, 'w') as f:
             json.dump(trades, f, indent=2)
         os.replace(tmp, TRADE_HISTORY_FILE)
+    return True
 
 def get_win_rate():
     """Calculate bot's win rate from closed trades"""
@@ -372,8 +412,11 @@ def get_win_rate():
 def backtest_strategy(symbol, timeframe="H1", days=30):
     """Backtest strategy where every valid signal is taken, even if a previous trade is still open.
 
-    This version fixes TP/SL logic for SELL trades, skips iterations with NaN indicators,
-    and uses explicit buy/sell TP/SL variables for clarity.
+    This version:
+    - fixes TP/SL logic for SELL trades,
+    - skips iterations with NaN indicators,
+    - uses explicit buy/sell TP/SL variables for clarity,
+    - enforces at most one trade per calendar day in the backtest (based on candle date).
 
     This keeps your original approach (checking TP/SL hits inside the same candle).
     If you want multi-candle trade tracking (hold until TP/SL hit in subsequent candles),
@@ -398,9 +441,23 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
         ema_long = EMAIndicator(df["Close"], 21).ema_indicator()
         rsi = RSIIndicator(df["Close"], 14).rsi()
         
+        last_trade_date = None  # track last date we took a trade (calendar date)
+        
         for i in range(1, len(df)):
             # skip if any required indicator is NaN for this index
             if pd.isna(ema_short.iloc[i]) or pd.isna(ema_long.iloc[i]) or pd.isna(rsi.iloc[i]):
+                continue
+
+            # Get candle date (use timestamp of index)
+            try:
+                candle_ts = pd.Timestamp(df.index[i])
+                candle_date = candle_ts.date()
+            except Exception:
+                # fallback to today's date (shouldn't happen in proper backtest)
+                candle_date = datetime.now().date()
+
+            # enforce one trade per day: skip if we already traded on this date
+            if last_trade_date is not None and candle_date == last_trade_date:
                 continue
 
             buy_signal = (ema_short.iloc[i] > ema_long.iloc[i]) and (rsi.iloc[i] < 70)
@@ -413,9 +470,12 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
             sell_tp = entry_price * 0.985
             sell_sl = entry_price * 1.015
             
+            trade_taken = False
+
             # Evaluate buy signal outcome within the same candle
             if buy_signal:
                 total_trades += 1
+                trade_taken = True
                 # If high reaches buy TP -> win
                 if df["High"].iloc[i] >= buy_tp:
                     wins += 1
@@ -427,8 +487,10 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
                 # else: no resolution within candle => treated as unresolved (no P/L)
             
             # Evaluate sell signal outcome within the same candle
-            if sell_signal:
+            # Note: if both buy and sell signals somehow true, we'll count both as separate trades.
+            if (not trade_taken) and sell_signal:
                 total_trades += 1
+                trade_taken = True
                 # For sell, TP is below entry: low reaching sell_tp -> win
                 if df["Low"].iloc[i] <= sell_tp:
                     wins += 1
@@ -438,6 +500,9 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
                     losses += 1
                     total_profit -= entry_price * 0.015
                 # else: unresolved within candle
+
+            if trade_taken:
+                last_trade_date = candle_date  # record that we took a trade this date
         
         return {
             "total_trades": total_trades,
@@ -463,7 +528,7 @@ def log_journal(pair, signal, tp, sl, entry, note):
                 journal = []
         
         entry_log = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "pair": pair,
             "signal": signal,
             "entry": entry,
@@ -741,7 +806,7 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
             if level in sigs['fib_levels']:
                 fib_text += f"  {level}: ${sigs['fib_levels'][level]:.{dec}f}\n"
 
-    await update.message.reply_text(
+    msg_text = (
         f"🟡 {pair_name} SIGNAL\n\n"
         f"{emoji[signal]} {signal} - {sigs['agreement']:.0f}% Agreement\n\n"
         f"📊 INDICATORS:\n"
@@ -759,9 +824,13 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         f"Stop Loss: {sl_s}\n\n"
         f"{note}"
     )
-    
-    # Auto-log trade to history
-    save_trade(pair_name, signal, sigs['tp'], sigs['sl'], price)
+
+    # Attempt to log (save_trade enforces one trade per UTC day and returns False if already traded today)
+    saved = save_trade(pair_name, signal, sigs['tp'], sigs['sl'], price)
+    if not saved:
+        msg_text += "\n\n⚠️ A trade has already been recorded today (UTC). This signal will not be logged."
+
+    await update.message.reply_text(msg_text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -844,6 +913,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pair = user_data.get("backtest_pair", "BTC-USD")
             try:
                 await update.message.reply_text(f"⏳ Running backtest on {days}d {pair}...")
+                # Use 60m interval for H1 equivalent in this context (yfinance accepts "60m")
                 result = backtest_strategy(pair, "60m", days)
                 if result and result['total_trades'] > 0:
                     msg = (f"✅ BACKTEST COMPLETE ({days}d {pair} H1):\n\n"
