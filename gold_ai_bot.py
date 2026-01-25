@@ -653,7 +653,7 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         df_h4 = fetch(TIMEFRAMES["H4"], symbol)
         df_h1 = fetch(TIMEFRAMES["H1"], symbol)
         df_m30 = fetch(TIMEFRAMES["M30"], symbol)
-        if not df_h4 or not df_h1 or not df_m30:
+        if df_h4 is None or df_h1 is None or df_m30 is None:
             await update.message.reply_text("❌ Not enough data for this pair.")
             return
         sig_h4 = analyze(df_h4, symbol)
@@ -666,7 +666,7 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         # choice is expected to be a timeframe key like "H1", "M30", etc.
         interval = TIMEFRAMES.get(choice, choice)
         df = fetch(interval, symbol)
-        if not df or len(df) == 0:
+        if df is None or len(df) == 0:
             await update.message.reply_text("❌ Not enough data for this pair. Try a different one.")
             return
         sigs = analyze(df, symbol)
