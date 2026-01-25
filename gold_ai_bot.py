@@ -664,41 +664,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_data = context.user_data
     
-    # Commands
+    # Commands FIRST (always check these before pair selection)
     if text.lower() == "/history":
-        wr = get_win_rate()
-        if wr:
-            msg = f"📈 WIN RATE:\n✅ Wins: {wr['wins']}\n❌ Losses: {wr['losses']}\nTotal: {wr['total_trades']}\n📊 Rate: {wr['win_rate']:.1f}%"
-        else:
-            msg = "No closed trades yet."
+        try:
+            wr = get_win_rate()
+            if wr and wr['total_trades'] > 0:
+                msg = f"📈 WIN RATE:\n✅ Wins: {wr['wins']}\n❌ Losses: {wr['losses']}\nTotal: {wr['total_trades']}\n📊 Rate: {wr['win_rate']:.1f}%"
+            else:
+                msg = "No closed trades yet."
+        except Exception as e:
+            msg = f"Error: {str(e)}"
         await update.message.reply_text(msg)
         return
     
     if text.lower() == "/backtest":
-        result = backtest_strategy("BTC-USD", "1h", 30)
-        if result:
-            msg = f"🔬 BACKTEST (30d BTC):\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Rate: {result['win_rate']:.1f}%\n💵 Profit: ${result['total_profit']:.2f}"
-        else:
-            msg = "Backtest failed."
+        try:
+            await update.message.reply_text("⏳ Running backtest... (this may take 10-15 seconds)")
+            result = backtest_strategy("BTC-USD", "1h", 7)  # Reduced to 7 days for speed
+            if result and result['total_trades'] > 0:
+                msg = f"🔬 BACKTEST (7d BTC H1):\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Win Rate: {result['win_rate']:.1f}%\n💵 P&L: ${result['total_profit']:.4f}"
+            else:
+                msg = "Backtest: insufficient data or no trades."
+        except Exception as e:
+            msg = f"Backtest error: {str(e)}"
         await update.message.reply_text(msg)
         return
     
     if text.lower().startswith("/journal"):
-        entries = get_journal_entries(5)
-        if entries:
-            msg = "📔 TRADE JOURNAL (Last 5):\n"
-            for e in entries[-5:]:
-                msg += f"\n{e['pair']} {e['signal']} @ ${e['entry']:.5f}\nNote: {e['user_note']}\n"
-        else:
-            msg = "No journal entries yet."
+        try:
+            entries = get_journal_entries(5)
+            if entries:
+                msg = "📔 TRADE JOURNAL (Last 5):\n"
+                for e in entries:
+                    msg += f"\n{e['pair']} {e['signal']} @ ${e['entry']:.5f}\nNote: {e['user_note']}\n"
+            else:
+                msg = "No journal entries yet."
+        except Exception as e:
+            msg = f"Journal error: {str(e)}"
         await update.message.reply_text(msg)
         return
     
     if text.lower().startswith("/note "):
-        note = text[6:]
-        if user_data.get("pair"):
-            log_journal(user_data.get("pair_name", "Unknown"), "USER_NOTE", 0, 0, 0, note)
-            await update.message.reply_text("✅ Note logged!")
+        try:
+            note = text[6:].strip()
+            if user_data.get("pair"):
+                log_journal(user_data.get("pair_name", "Unknown"), "USER_NOTE", 0, 0, 0, note)
+                await update.message.reply_text("✅ Note logged!")
+            else:
+                await update.message.reply_text("⚠️ Select a pair first, then use /note")
+        except Exception as e:
+            await update.message.reply_text(f"Note error: {str(e)}")
         return
     
     # Step 1: Start - ask for type
