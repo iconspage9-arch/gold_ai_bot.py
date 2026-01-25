@@ -324,7 +324,7 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
             df.columns = df.columns.get_level_values(0)
         df.dropna(inplace=True)
         
-        if len(df) < 50:
+        if len(df) < 20:
             return None
         
         wins = 0
@@ -332,44 +332,57 @@ def backtest_strategy(symbol, timeframe="H1", days=30):
         total_profit = 0
         
         # Simulate signals on historical data
-        for i in range(50, len(df)):
-            window = df.iloc[i-50:i]
+        for i in range(20, len(df)):
+            window = df.iloc[max(0, i-50):i+1]
             last = window.iloc[-1]
             
-            # Quick signal check
-            ema50 = EMAIndicator(window["Close"], 50).ema_indicator().iloc[-1]
-            ema200 = EMAIndicator(window["Close"], 200).ema_indicator().iloc[-1]
+            # Simple signal check - use shorter periods for small datasets
             rsi = RSIIndicator(window["Close"], 14).rsi().iloc[-1]
+            ema9 = EMAIndicator(window["Close"], 9).ema_indicator().iloc[-1]
+            ema21 = EMAIndicator(window["Close"], 21).ema_indicator().iloc[-1]
             
-            signal = "BUY" if ema50 > ema200 and rsi < 70 else "SELL" if ema50 < ema200 and rsi > 30 else None
+            # Relaxed signal: just check EMA9 > EMA21 + RSI not extreme
+            signal = None
+            if ema9 > ema21 and rsi < 80:
+                signal = "BUY"
+            elif ema9 < ema21 and rsi > 20:
+                signal = "SELL"
             
             if signal and i + 1 < len(df):
                 entry = last['Close']
-                future = df.iloc[i+1]
-                
-                if signal == "BUY":
-                    if future['High'] > entry * 1.02:  # TP hit (2%)
-                        wins += 1
-                        total_profit += entry * 0.02
-                    elif future['Low'] < entry * 0.99:  # SL hit (1%)
-                        losses += 1
-                        total_profit -= entry * 0.01
-                else:
-                    if future['Low'] < entry * 0.98:  # TP hit (2%)
-                        wins += 1
-                        total_profit += entry * 0.02
-                    elif future['High'] > entry * 1.01:  # SL hit (1%)
-                        losses += 1
-                        total_profit -= entry * 0.01
+                # Check next 3 candles for TP/SL hit (more likely with small lookback)
+                for j in range(1, min(4, len(df) - i)):
+                    future = df.iloc[i+j]
+                    
+                    if signal == "BUY":
+                        if future['High'] >= entry * 1.015:  # TP hit (1.5%)
+                            wins += 1
+                            total_profit += entry * 0.015
+                            break
+                        elif future['Low'] <= entry * 0.985:  # SL hit (1.5%)
+                            losses += 1
+                            total_profit -= entry * 0.015
+                            break
+                    else:  # SELL
+                        if future['Low'] <= entry * 0.985:  # TP hit (1.5%)
+                            wins += 1
+                            total_profit += entry * 0.015
+                            break
+                        elif future['High'] >= entry * 1.015:  # SL hit (1.5%)
+                            losses += 1
+                            total_profit -= entry * 0.015
+                            break
         
+        total_trades = wins + losses
         return {
-            "total_trades": wins + losses,
+            "total_trades": total_trades,
             "wins": wins,
             "losses": losses,
-            "win_rate": (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0,
+            "win_rate": (wins / total_trades * 100) if total_trades > 0 else 0,
             "total_profit": total_profit
         }
     except Exception as e:
+        print(f"Backtest error: {e}")
         return None
 
 # ================= FEATURE: TRADE JOURNAL =================
@@ -771,8 +784,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_data.get("stage") == "choosing_type":
         if text.upper() in PAIRS_BY_TYPE:
             user_data["type"] = text.upper()
-            pairs = PAIRS_BY_TYPE[text.upper()]
-            kb = [[p] for p in pairs[:4]]  # Show first 4
+            pairs_dict = PAIRS_BY_TYPE[text.upper()]
+            pair_names = list(pairs_dict.keys())  # Get dictionary keys
+            kb = [[p] for p in pair_names[:4]]  # Show first 4
             await update.message.reply_text(f"Choose {text} pair:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
             user_data["stage"] = "choosing_pair"
             return
@@ -780,9 +794,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Step 6: CHOOSING PAIR
     if user_data.get("stage") == "choosing_pair":
         pair_type = user_data.get("type", "COMMODITIES")
-        if text in PAIRS_BY_TYPE.get(pair_type, []):
+        pairs_dict = PAIRS_BY_TYPE.get(pair_type, {})
+        if text in pairs_dict:
             user_data["pair_name"] = text
-            user_data["pair"] = PAIRS_BY_TYPE[pair_type][text]  # Get symbol from dict
+            user_data["pair"] = pairs_dict[text]  # Get symbol from dict
             
             kb = [["M30", "H1"], ["H4", "D1"]]
             await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
