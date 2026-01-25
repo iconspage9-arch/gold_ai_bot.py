@@ -29,6 +29,7 @@ PAIRS_BY_TYPE = {
         "NATGAS": "NG=F"
     },
     "FOREX": {
+        # Each base maps to a list of possible quote currencies (we will pick the first quote by default)
         "EUR": ["USD", "GBP", "CHF", "JPY"],
         "GBP": ["USD", "JPY"],
         "JPY": ["USD", "EUR", "GBP", "AUD"],
@@ -88,7 +89,7 @@ def pips_to_decimal(pair_name, pips):
 
 # Helper function to build forex pair symbol
 def build_forex_symbol(base, quote):
-    """Convert base/quote to yfinance symbol (e.g., USD+GBP -> USDGBP=X)"""
+    """Convert base/quote to yfinance symbol (e.g., EUR + USD -> EURUSD=X)"""
     return f"{base}{quote}=X"
 
 # ================= DATA FUNCTIONS =================
@@ -96,6 +97,7 @@ def fetch(tf, symbol="GC=F"):
     try:
         df = yf.download(symbol, period="30d", interval=tf, progress=False)
         if df is None or len(df) == 0:
+            print(f"fetch: no rows for {symbol} interval={tf}")
             return None
         
         # Handle MultiIndex columns
@@ -104,11 +106,13 @@ def fetch(tf, symbol="GC=F"):
         
         # Check if we have required columns
         if 'Close' not in df.columns or 'High' not in df.columns or 'Low' not in df.columns:
+            print(f"fetch: missing OHLC columns for {symbol} interval={tf} cols={list(df.columns)}")
             return None
         
         # Remove NaN values first
         df = df.dropna()
-        if len(df) < 200:  # Need at least 200 bars for EMA200
+        if len(df) < 50:  # lowered minimum bars to 50 (EMA200 optional)
+            print(f"fetch: insufficient bars for {symbol} interval={tf} rows={len(df)} (need>=50)")
             return None
         
         # Convert to numeric, handle any string values
@@ -119,7 +123,12 @@ def fetch(tf, symbol="GC=F"):
         # Calculate indicators only if we have valid data
         try:
             df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-            df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+            # Compute ema200 only if we have enough bars; otherwise leave as NaN
+            if len(df) >= 200:
+                df["ema200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+            else:
+                df["ema200"] = np.nan
+
             df["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
             
             macd = MACD(df["Close"], window_fast=12, window_slow=26, window_sign=9)
@@ -139,15 +148,17 @@ def fetch(tf, symbol="GC=F"):
             df["stoch_k"] = stoch.stoch()
             df["stoch_d"] = stoch.stoch_signal()
             
-            # Remove NaN from indicators
-            df = df.dropna()
+            # Remove NaN from indicators where possible (but keep rows if some indicators are NaN)
+            df = df.dropna(subset=['Close', 'High', 'Low'])
+            if len(df) == 0:
+                return None
             
-            return df if len(df) > 0 else None
+            return df
         except Exception as e:
             print(f"Indicator calculation error: {e}")
             return None
     except Exception as e:
-        print(f"Fetch error for {symbol}: {e}")
+        print(f"Fetch error for {symbol} interval={tf}: {e}")
         return None
 
 # ================= FEATURE: DIVERGENCE DETECTION =================
@@ -281,10 +292,10 @@ def detect_patterns(df):
     # Cup & Handle: U-shaped recovery with small pullback
     if len(recent) >= 30:
         low_idx = recent['Low'].iloc[-30:].argmin()  # Get position, not label
-        left_high = recent['High'].iloc[-30:low_idx].max()
+        left_high = recent['High'].iloc[-30:low_idx].max() if low_idx > 0 else 0
         right_high = recent['High'].iloc[low_idx:].max()
         
-        if abs(left_high - right_high) / left_high < 0.02 and left_high > recent['Low'].iloc[-1]:
+        if left_high and abs(left_high - right_high) / left_high < 0.02 and left_high > recent['Low'].iloc[-1]:
             # Check for handle (small pullback)
             handle_low = recent['Low'].iloc[-5:].min()
             if handle_low > recent['Low'].iloc[low_idx]:
@@ -450,7 +461,13 @@ def analyze(df, symbol=None):
     signals = []
     
     # Signal 1: EMA Trend (50/200 crossover)
-    ema_signal = "BUY" if last.ema50 > last.ema200 else "SELL"
+    # Handle missing ema200: use fallback
+    ema200_val = getattr(last, 'ema200', np.nan)
+    if pd.notna(ema200_val):
+        ema_signal = "BUY" if last.ema50 > last.ema200 else "SELL"
+    else:
+        # Fallback: compare ema50 to price if ema200 not available
+        ema_signal = "BUY" if last.ema50 > last.Close else "SELL"
     signals.append(ema_signal)
     
     # Signal 2: RSI (oversold/overbought)
@@ -646,7 +663,9 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
         sigs = sig_m30
         df = df_m30
     else:
-        df = fetch(TIMEFRAMES[choice], symbol)
+        # choice is expected to be a timeframe key like "H1", "M30", etc.
+        interval = TIMEFRAMES.get(choice, choice)
+        df = fetch(interval, symbol)
         if not df or len(df) == 0:
             await update.message.reply_text("❌ Not enough data for this pair. Try a different one.")
             return
@@ -676,7 +695,7 @@ async def send_signal(update: Update, choice, symbol="GC=F", pair_name="GOLD"):
     
     # Build message with all features
     div_text = ""
-    if sigs['divergence']['rsi'] or sigs['divergence']['macd']:
+    if sigs['divergence'] and (sigs['divergence'].get('rsi') or sigs['divergence'].get('macd')):
         div_text = f"🔷 DIVERGENCE: RSI {sigs['divergence']['rsi'] or 'None'} | MACD {sigs['divergence']['macd'] or 'None'}\n"
     
     pattern_text = ""
@@ -796,7 +815,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"⏳ Running backtest on {days}d {pair}...")
                 result = backtest_strategy(pair, "1h", days)
                 if result and result['total_trades'] > 0:
-                    msg = f"✅ BACKTEST COMPLETE ({days}d {pair} H1):\n\n💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n❌ Losses: {result['losses']}\n📊 Win Rate: {result['win_rate']:.1f}%\n💵 P&L: ${result['total_profit']:.4f}"
+                    msg = (f"✅ BACKTEST COMPLETE ({days}d {pair} H1):\n\n"
+                           f"💰 Trades: {result['total_trades']}\n✅ Wins: {result['wins']}\n"
+                           f"❌ Losses: {result['losses']}\n📊 Win Rate: {result['win_rate']:.2f}%\n"
+                           f"💵 Total Profit: {result['total_profit']:.2f}")
                 else:
                     msg = f"❌ Backtest: No trades found for {pair}"
             except Exception as e:
@@ -837,7 +859,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pairs_dict = PAIRS_BY_TYPE.get(pair_type, {})
         if text in pairs_dict:
             user_data["pair_name"] = text
-            user_data["pair"] = pairs_dict[text]  # Get symbol from dict
+            val = pairs_dict[text]
+            # Handle FOREX lists (base -> [quotes]) by building a symbol using the first quote by default
+            if isinstance(val, list):
+                quote = val[0]
+                symbol = build_forex_symbol(text, quote)
+            else:
+                symbol = val
+            user_data["pair"] = symbol  # Get symbol from dict
             
             kb = [["M30", "H1"], ["H4", "D1"]]
             await update.message.reply_text("Choose timeframe:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True))
@@ -854,12 +883,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 await update.message.reply_text("⏳ Analyzing... This may take 5-10 seconds...")
-                df = fetch(text, pair_symbol)
+                # map key (H1 etc.) to actual interval string (30m, 60m, etc.)
+                interval = TIMEFRAMES.get(text, text)
+                df = fetch(interval, pair_symbol)
                 if df is not None and len(df) > 0:
                     result = analyze(df, pair_symbol)
-                    await send_signal(update, pair_type, pair_symbol, pair_name)
+                    # send_signal expects the timeframe key (e.g., "H1") or "MULTI"
+                    await send_signal(update, text, pair_symbol, pair_name)
                 else:
-                    await update.message.reply_text(f"❌ No data for {pair_name}")
+                    await update.message.reply_text(f"❌ No data for {pair_name} (symbol={pair_symbol}, interval={interval})")
             except Exception as e:
                 await update.message.reply_text(f"❌ Error: {str(e)}")
             
